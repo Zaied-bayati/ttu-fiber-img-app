@@ -87,6 +87,10 @@ jobs:
           -c ${{ env.CONFIGURATION }}
           -p:Platform=${{ env.PLATFORM }}
           -p:RuntimeIdentifier=win-x64
+          -p:AppxPackageSigningEnabled=false
+          -p:GenerateAppInstallerFile=false
+          -p:GenerateAppxPackageOnBuild=false
+          -p:PackageCertificateThumbprint=
           --no-restore
 
       - name: Publish (win-x64)
@@ -98,6 +102,7 @@ jobs:
           -p:PublishReadyToRun=true
           -p:GenerateAppxPackageOnBuild=true
           -p:AppxPackageSigningEnabled=true
+          -p:PackageCertificateThumbprint=
           -p:PackageCertificateKeyFile=${{ env.PFX_PATH }}
           -p:PackageCertificatePassword=${{ secrets.MSIX_CERT_PASSWORD }}
           -p:AppxBundle=Never
