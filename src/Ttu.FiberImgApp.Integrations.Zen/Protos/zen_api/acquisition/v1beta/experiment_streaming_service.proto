@@ -1,0 +1,20 @@
+syntax = "proto3";
+package zen_api.acquisition.v1beta;
+option csharp_namespace = "ZenApi.Acquisition.V1Beta";
+import "google/protobuf/wrappers.proto";
+import "zen_api/acquisition/v1beta/frame_data.proto";
+
+message ExperimentStreamingServiceMonitorExperimentRequest {
+  string experiment_id = 1;
+  google.protobuf.Int32Value channel_index = 2;
+  bool enable_raw_data = 3;
+}
+
+message ExperimentStreamingServiceMonitorExperimentResponse {
+  FrameData frame_data = 1;
+}
+
+service ExperimentStreamingService {
+  rpc MonitorExperiment(ExperimentStreamingServiceMonitorExperimentRequest)
+      returns (stream ExperimentStreamingServiceMonitorExperimentResponse);
+}

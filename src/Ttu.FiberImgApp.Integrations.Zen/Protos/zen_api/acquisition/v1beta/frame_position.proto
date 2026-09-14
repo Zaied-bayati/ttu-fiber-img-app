@@ -1,0 +1,14 @@
+syntax = "proto3";
+package zen_api.acquisition.v1beta;
+option csharp_namespace = "ZenApi.Acquisition.V1Beta";
+
+message FramePosition {
+  int32 x = 1;
+  int32 y = 2;
+  int32 z = 3;
+  int32 t = 4;
+  int32 s = 5;
+  int32 m = 6;
+  int32 c = 7;
+  int32 h = 8;
+}

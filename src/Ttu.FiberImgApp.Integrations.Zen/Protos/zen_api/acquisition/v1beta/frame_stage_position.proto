@@ -1,0 +1,10 @@
+syntax = "proto3";
+package zen_api.acquisition.v1beta;
+option csharp_namespace = "ZenApi.Acquisition.V1Beta";
+import "google/protobuf/wrappers.proto";
+
+message FrameStagePosition {
+  google.protobuf.DoubleValue x = 1;
+  google.protobuf.DoubleValue y = 2;
+  google.protobuf.DoubleValue z = 3;
+}

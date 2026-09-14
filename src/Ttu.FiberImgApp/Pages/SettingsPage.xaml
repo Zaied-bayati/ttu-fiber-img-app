@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<Page
+    x:Class="Ttu.FiberImgApp.Pages.SettingsPage"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+    xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+    mc:Ignorable="d">
+
+    <ScrollViewer Padding="20">
+        <StackPanel Spacing="20" MaxWidth="720">
+            <TextBlock Text="Settings" Style="{StaticResource TitleTextBlockStyle}" />
+            <TextBlock Text="{x:Bind ViewModel.Message, Mode=OneWay}" TextWrapping="WrapWholeWords" Foreground="DarkOrange" />
+            <TextBlock Text="{x:Bind ViewModel.StageStatus, Mode=OneWay}" TextWrapping="WrapWholeWords" Opacity="0.85" />
+            <TextBlock Text="{x:Bind ViewModel.CameraStatus, Mode=OneWay}" TextWrapping="WrapWholeWords" Opacity="0.85" />
+
+            <TextBlock Text="Zeiss ZEN / Axiocam" Style="{StaticResource SubtitleTextBlockStyle}" />
+            <ToggleSwitch Header="Use ZEN simulator (no Gateway)" IsOn="{x:Bind ViewModel.ZenUseSimulator, Mode=TwoWay}" />
+            <TextBox Header="Gateway host" Text="{x:Bind ViewModel.ZenHost, Mode=TwoWay}" />
+            <NumberBox Header="Gateway port" Value="{x:Bind ViewModel.ZenPort, Mode=TwoWay}" Minimum="1" Maximum="65535" SpinButtonPlacementMode="Inline" />
+            <TextBox Header="Experiment name (no .czexp)" Text="{x:Bind ViewModel.ZenExperimentName, Mode=TwoWay}" />
+            <PasswordBox x:Name="ZenTokenBox" Header="API control token" PasswordChanged="ZenTokenBox_PasswordChanged" />
+            <TextBox Header="Gateway certificate path (optional .pem/.crt)" Text="{x:Bind ViewModel.ZenCertificatePath, Mode=TwoWay}" TextWrapping="Wrap" />
+            <ToggleSwitch Header="Allow untrusted certificate (lab only)" IsOn="{x:Bind ViewModel.ZenAllowUntrustedCertificate, Mode=TwoWay}" />
+            <StackPanel Orientation="Horizontal" Spacing="8">
+                <Button Content="Connect camera" Command="{x:Bind ViewModel.ConnectCameraCommand}" />
+                <Button Content="Disconnect camera" Command="{x:Bind ViewModel.DisconnectCameraCommand}" />
+            </StackPanel>
+
+            <TextBlock Text="Thorlabs stage" Style="{StaticResource SubtitleTextBlockStyle}" />
+            <ToggleSwitch Header="Use Thorlabs simulator (no hardware)" IsOn="{x:Bind ViewModel.UseSimulator, Mode=TwoWay}" />
+            <TextBox Header="Serial number (optional)" Text="{x:Bind ViewModel.SerialNumber, Mode=TwoWay}" />
+            <NumberBox Header="BSC202 channel" Value="{x:Bind ViewModel.Channel, Mode=TwoWay}" Minimum="1" Maximum="2" SpinButtonPlacementMode="Inline" />
+            <StackPanel Orientation="Horizontal" Spacing="8">
+                <Button Content="Connect stage" Command="{x:Bind ViewModel.ConnectCommand}" />
+                <Button Content="Disconnect stage" Command="{x:Bind ViewModel.DisconnectCommand}" />
+            </StackPanel>
+
+            <TextBlock Text="Travel limits (mm)" Style="{StaticResource SubtitleTextBlockStyle}" />
+            <NumberBox Header="Minimum" Value="{x:Bind ViewModel.MinMm, Mode=TwoWay}" SmallChange="0.1" LargeChange="1" SpinButtonPlacementMode="Inline" />
+            <NumberBox Header="Maximum (NRT100 typically 100)" Value="{x:Bind ViewModel.MaxMm, Mode=TwoWay}" SmallChange="0.1" LargeChange="1" SpinButtonPlacementMode="Inline" />
+
+            <TextBlock Text="Motion profile" Style="{StaticResource SubtitleTextBlockStyle}" />
+            <NumberBox Header="Velocity (mm/s)" Value="{x:Bind ViewModel.VelocityMmPerSec, Mode=TwoWay}" Minimum="0.1" SmallChange="0.5" SpinButtonPlacementMode="Inline" />
+            <NumberBox Header="Acceleration (mm/s2)" Value="{x:Bind ViewModel.AccelerationMmPerSec2, Mode=TwoWay}" Minimum="0.1" SmallChange="0.5" SpinButtonPlacementMode="Inline" />
+
+            <TextBlock Text="Manual move" Style="{StaticResource SubtitleTextBlockStyle}" />
+            <NumberBox Header="Jog step (mm)" Value="{x:Bind ViewModel.JogStepMm, Mode=TwoWay}" Minimum="0.01" SmallChange="0.1" SpinButtonPlacementMode="Inline" />
+            <StackPanel Orientation="Horizontal" Spacing="8">
+                <Button Content="Jog -" Command="{x:Bind ViewModel.JogCommand}" CommandParameter="-" />
+                <Button Content="Jog +" Command="{x:Bind ViewModel.JogCommand}" CommandParameter="+" />
+                <Button Content="Home" Command="{x:Bind ViewModel.HomeCommand}" />
+                <Button Content="Stop" Command="{x:Bind ViewModel.StopCommand}" />
+            </StackPanel>
+            <NumberBox Header="Go to position (mm)" Value="{x:Bind ViewModel.GoToMm, Mode=TwoWay}" SmallChange="0.1" SpinButtonPlacementMode="Inline" />
+            <Button Content="Go to" Command="{x:Bind ViewModel.GoToCommand}" />
+
+            <TextBlock Text="Files" Style="{StaticResource SubtitleTextBlockStyle}" />
+            <TextBox Header="Sessions folder" Text="{x:Bind ViewModel.SessionsRootPath, Mode=TwoWay}" TextWrapping="Wrap" />
+
+            <Button Content="Save settings" Style="{StaticResource AccentButtonStyle}" Command="{x:Bind ViewModel.SaveCommand}" HorizontalAlignment="Left" />
+            <ProgressRing IsActive="{x:Bind ViewModel.IsBusy, Mode=OneWay}" HorizontalAlignment="Left" />
+        </StackPanel>
+    </ScrollViewer>
+</Page>

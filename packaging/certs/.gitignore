@@ -1,0 +1,3 @@
+# Placeholder so packaging/certs exists locally; *.pfx/*.cer are gitignored.
+*
+!.gitignore

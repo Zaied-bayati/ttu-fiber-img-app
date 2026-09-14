@@ -1,0 +1,11 @@
+syntax = "proto3";
+package zen_api.acquisition.v1beta;
+option csharp_namespace = "ZenApi.Acquisition.V1Beta";
+
+enum PixelType {
+  PIXEL_TYPE_UNSPECIFIED = 0;
+  PIXEL_TYPE_GRAY8 = 1;
+  PIXEL_TYPE_GRAY16 = 2;
+  PIXEL_TYPE_BGR24 = 4;
+  PIXEL_TYPE_BGR48 = 5;
+}

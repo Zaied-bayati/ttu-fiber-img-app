@@ -1,4 +1,4 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
     <TargetFramework>net10.0</TargetFramework>
@@ -9,11 +9,32 @@
 
   <ItemGroup>
     <ProjectReference Include="..\Ttu.FiberImgApp.Core\Ttu.FiberImgApp.Core.csproj" />
+    <ProjectReference Include="..\Ttu.FiberImgApp.Infrastructure\Ttu.FiberImgApp.Infrastructure.csproj" />
   </ItemGroup>
 
   <ItemGroup>
+    <PackageReference Include="Google.Protobuf" Version="3.31.1" />
+    <PackageReference Include="Grpc.Net.Client" Version="2.71.0" />
+    <PackageReference Include="Grpc.Tools" Version="2.72.0">
+      <PrivateAssets>all</PrivateAssets>
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+    </PackageReference>
     <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="10.0.1" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.1" />
     <PackageReference Include="Microsoft.Extensions.Options" Version="10.0.1" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Protobuf Include="Protos\zen_api\common\v1\int_point.proto" GrpcServices="None" ProtoRoot="Protos" />
+    <Protobuf Include="Protos\zen_api\common\v1\int_size.proto" GrpcServices="None" ProtoRoot="Protos" />
+    <Protobuf Include="Protos\zen_api\acquisition\v1beta\pixel_type.proto" GrpcServices="None" ProtoRoot="Protos" />
+    <Protobuf Include="Protos\zen_api\acquisition\v1beta\scaling.proto" GrpcServices="None" ProtoRoot="Protos" />
+    <Protobuf Include="Protos\zen_api\acquisition\v1beta\frame_position.proto" GrpcServices="None" ProtoRoot="Protos" />
+    <Protobuf Include="Protos\zen_api\acquisition\v1beta\frame_stage_position.proto" GrpcServices="None" ProtoRoot="Protos" />
+    <Protobuf Include="Protos\zen_api\acquisition\v1beta\frame_pixel_data.proto" GrpcServices="None" ProtoRoot="Protos" />
+    <Protobuf Include="Protos\zen_api\acquisition\v1beta\frame_data.proto" GrpcServices="None" ProtoRoot="Protos" />
+    <Protobuf Include="Protos\zen_api\acquisition\v1beta\experiment_service.proto" GrpcServices="Client" ProtoRoot="Protos" />
+    <Protobuf Include="Protos\zen_api\acquisition\v1beta\experiment_streaming_service.proto" GrpcServices="Client" ProtoRoot="Protos" />
   </ItemGroup>
 
 </Project>

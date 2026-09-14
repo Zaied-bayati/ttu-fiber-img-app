@@ -35,7 +35,7 @@ public partial class MainViewModel : ObservableObject
     public partial string UpdateUri { get; set; } = string.Empty;
 
     [ObservableProperty]
-    public partial string StatusMessage { get; set; } = "Skeleton ready. UI and hardware features come next.";
+    public partial string StatusMessage { get; set; } = "Use Capture for live camera + sampling. Configure ZEN in Settings.";
 
     [RelayCommand]
     private void RefreshStatus()
@@ -48,18 +48,18 @@ public partial class MainViewModel : ObservableObject
     [RelayCommand]
     private async Task ConnectZenAsync()
     {
-        StatusMessage = "Connecting to ZEN (stub)...";
+        StatusMessage = "Connecting to ZEN...";
         var ok = await _zenClient.ConnectAsync();
-        StatusMessage = ok ? "ZEN connected." : "ZEN not connected (stub / NotConfigured).";
+        StatusMessage = ok ? "ZEN connected." : "ZEN not connected (check Settings / Gateway).";
         RefreshStatus();
     }
 
     [RelayCommand]
     private async Task ConnectThorlabsAsync()
     {
-        StatusMessage = "Connecting to Thorlabs (stub)...";
+        StatusMessage = "Connecting to Thorlabs...";
         var ok = await _thorlabsClient.ConnectAsync();
-        StatusMessage = ok ? "Thorlabs connected." : "Thorlabs not connected (stub / NotConfigured).";
+        StatusMessage = ok ? "Thorlabs connected." : "Thorlabs not connected (check Settings / simulator).";
         RefreshStatus();
     }
 }

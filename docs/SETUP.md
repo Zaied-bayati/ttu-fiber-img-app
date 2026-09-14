@@ -204,11 +204,37 @@ Or run **Release MSIX** via Actions → **workflow_dispatch** and enter `0.1.0.0
 
 ---
 
-## Phase 8 — ZEN / Thorlabs readiness (later)
+## Phase 8 — ZEN / Thorlabs readiness
 
-1. On the lab PC: confirm ZEN install and whether **ZEN API / gateway** is enabled (ZEISS Microscopy Installer).
-2. Identify Thorlabs XA/.NET SDK or automation surface; keep using `IThorlabsClient` / `IZenClient`.
-3. Replace `NotConfiguredZenClient` / `NotConfiguredThorlabsClient` without changing ViewModels.
+### Thorlabs XA (BSC202 + NRT100)
+
+1. Install **Thorlabs XA** from Thorlabs Motion Control downloads (includes USB drivers + SDK).
+2. You do **not** need the XA GUI open while Fiber Img App runs — close XA/Kinesis first so the USB device is free.
+3. In the app **Settings**:
+   - Leave **Use simulator** on until XA is installed and verified.
+   - Set channel **1** (default) for the NRT100 on BSC202.
+   - Travel defaults **0–100 mm** (NRT100). Adjust min/max if needed.
+   - Set velocity / acceleration, then **Save settings**.
+4. **Connect** in Settings or Capture, then use manual jog / Begin Sampling.
+5. Real XA binding: `XaThorlabsClient` loads SDK DLLs from `C:\Program Files\Thorlabs\XA` when `UseSimulator` is false. If connect fails, check serial/channel and finish SDK wiring using Thorlabs XA examples on the lab PC.
+
+### Zeiss ZEN API (Axiocam 820 mono)
+
+Prerequisites: **ZEN Blue or ZEN core 3.11+**, **ZEN API Gateway** (install via ZEISS Microscopy Installer / ZMI), and a control token. The Axiocam 820 is selected inside a ZEN experiment — this app talks to the Gateway over gRPC (TLS), not USB directly.
+
+1. Install ZEN (3.11+) and the **ZEN API Gateway**. Optionally install the ZEN API proto files (`C:\Users\Public\Documents\Carl Zeiss\ZEN API Proto Files`) for reference.
+2. In ZEN, create and save a live/snap experiment that uses the **Axiocam 820 mono**. Note the experiment name **without** the `.czexp` extension.
+3. Create an API **control token** in the Gateway / ZEN API tooling.
+4. Trust the Gateway TLS certificate on this PC (or set `Zen:CertificatePath` to the CA `.pem`/`.crt`, or temporarily `Zen:AllowUntrustedCertificate` for lab bring-up only).
+5. In Fiber Img App **Settings → Zeiss ZEN / Axiocam**:
+   - Turn **off** "Use ZEN simulator".
+   - Set host (usually `localhost`), port (default `50051`), experiment name, and paste the control token.
+   - **Save settings**, then **restart the app** (DI picks simulator vs real client at startup).
+6. On **Capture**: Connect camera → Start live. Double-click the preview (or Fullscreen live) for a zoomable viewer (scroll wheel / Zoom ± / Esc).
+7. Sampling stills use the **latest live frame** encoded as PNG (no CZI dependency in this version).
+8. If live fails with a busy / conflict error, stop Live in the ZEN UI so the Gateway can start live from this app.
+
+Offline: leave **Use ZEN simulator** on — Capture shows a synthetic gray live stream for UI testing without Gateway.
 
 ---
 
@@ -216,4 +242,5 @@ Or run **Release MSIX** via Actions → **workflow_dispatch** and enter `0.1.0.0
 
 - **Public repo** hosts source + Releases (App Installer can download without auth).
 - Never commit secrets; use `appsettings.Local.json` (gitignored) or `%LocalAppData%\TTU\FiberImgApp\appsettings.Local.json`.
-- Integrations are stubs today so HMI features can land incrementally.
+- Default saved images: `Documents\TTU\FiberImgApp\Sessions\yyyy-MM-dd_HH-mm-ss\`.
+- Simulator mode lets you exercise Capture → Sample → Review without hardware.

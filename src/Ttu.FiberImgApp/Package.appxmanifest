@@ -9,7 +9,7 @@
   <Identity
     Name="TTU.FiberImgApp"
     Publisher="CN=TTU"
-    Version="0.1.0.0" />
+    Version="0.1.4.0" />
 
   <mp:PhoneIdentity PhoneProductId="a1b2c3d4-e5f6-7890-abcd-ef1234567890" PhonePublisherId="00000000-0000-0000-0000-000000000000"/>
 

@@ -16,8 +16,8 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <!-- App Installer / sideload packaging defaults (override in CI) -->
-    <GenerateAppInstallerFile>False</GenerateAppInstallerFile>
-    <AppxPackageSigningEnabled>False</AppxPackageSigningEnabled>
+    <GenerateAppInstallerFile>True</GenerateAppInstallerFile>
+    <AppxPackageSigningEnabled>True</AppxPackageSigningEnabled>
     <AppxBundle>Never</AppxBundle>
     <AppxPackageDir>$(MSBuildThisFileDirectory)..\..\artifacts\msix\</AppxPackageDir>
     <AppInstallerUri>https://github.com/Zaied-bayati/ttu-fiber-img-app/releases/latest/download/</AppInstallerUri>
@@ -76,5 +76,9 @@
     <PublishReadyToRun Condition="'$(Configuration)' != 'Debug'">True</PublishReadyToRun>
     <!-- EF Core / DI need trimming turned off for the skeleton -->
     <PublishTrimmed>False</PublishTrimmed>
+    <PackageCertificateThumbprint>C04B8A4265925F1A33AEC02AEBE44F73A88647CF</PackageCertificateThumbprint>
+    <AppxPackageSigningTimestampDigestAlgorithm>SHA256</AppxPackageSigningTimestampDigestAlgorithm>
+    <AppxAutoIncrementPackageRevision>True</AppxAutoIncrementPackageRevision>
+    <GenerateTestArtifacts>False</GenerateTestArtifacts>
   </PropertyGroup>
 </Project>

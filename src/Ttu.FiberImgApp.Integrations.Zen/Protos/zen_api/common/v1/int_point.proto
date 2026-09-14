@@ -1,0 +1,8 @@
+syntax = "proto3";
+package zen_api.common.v1;
+option csharp_namespace = "ZenApi.Common.V1";
+
+message IntPoint {
+  int32 x = 1;
+  int32 y = 2;
+}

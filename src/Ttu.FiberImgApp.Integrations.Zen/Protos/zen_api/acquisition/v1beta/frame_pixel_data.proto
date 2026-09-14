@@ -1,0 +1,13 @@
+syntax = "proto3";
+package zen_api.acquisition.v1beta;
+option csharp_namespace = "ZenApi.Acquisition.V1Beta";
+import "zen_api/common/v1/int_point.proto";
+import "zen_api/common/v1/int_size.proto";
+import "zen_api/acquisition/v1beta/pixel_type.proto";
+
+message FramePixelData {
+  zen_api.common.v1.IntPoint start_position = 1;
+  zen_api.common.v1.IntSize size = 2;
+  PixelType pixel_type = 3;
+  bytes raw_data = 4;
+}

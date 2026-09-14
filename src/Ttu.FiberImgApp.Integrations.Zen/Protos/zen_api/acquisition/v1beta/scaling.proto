@@ -1,0 +1,8 @@
+syntax = "proto3";
+package zen_api.acquisition.v1beta;
+option csharp_namespace = "ZenApi.Acquisition.V1Beta";
+
+message Scaling {
+  double x = 1;
+  double y = 2;
+}
