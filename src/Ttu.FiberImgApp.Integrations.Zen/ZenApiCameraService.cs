@@ -185,10 +185,11 @@ public sealed class ZenApiCameraService : ICameraService, IZenClient, IAsyncDisp
         if (IsConnected) SetStatus("ZEN connected - live stopped");
     }
 
-    public Task<byte[]> CaptureStillAsync(CancellationToken cancellationToken = default)
+    public async Task<byte[]> CaptureStillAsync(CancellationToken cancellationToken = default)
     {
-        var frame = GetLastFrameOrThrow();
-        return Task.FromResult(MonoFrameEncoder.ToPng(frame));
+        // Wait for a frame acquired after this call so sampling does not save a pre-move exposure.
+        var frame = await WaitForFreshFrameAsync(cancellationToken).ConfigureAwait(false);
+        return MonoFrameEncoder.ToPng(frame);
     }
 
     public Task<byte[]> GetPreviewFrameAsync(CancellationToken cancellationToken = default)
@@ -198,6 +199,47 @@ public sealed class ZenApiCameraService : ICameraService, IZenClient, IAsyncDisp
         if (frame is null)
             throw new InvalidOperationException("No frame yet. Start live preview first.");
         return Task.FromResult(MonoFrameEncoder.ToPng(frame));
+    }
+
+    /// <summary>
+    /// Blocks until the live stream delivers a frame newer than the one present at call time.
+    /// Fails if live is down or the stream dies while waiting (avoids returning a stale frame).
+    /// </summary>
+    private async Task<CameraFrame> WaitForFreshFrameAsync(CancellationToken cancellationToken)
+    {
+        DateTimeOffset threshold;
+        lock (_gate)
+        {
+            if (!_connected)
+                throw new InvalidOperationException("ZEN camera is not connected.");
+            if (!_live)
+                throw new InvalidOperationException("ZEN live stream is not running. Start live, then capture.");
+            threshold = _lastFrame?.CapturedAt ?? DateTimeOffset.MinValue;
+        }
+
+        const int timeoutMs = 15_000;
+        var started = Environment.TickCount64;
+        while (Environment.TickCount64 - started < timeoutMs)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            lock (_gate)
+            {
+                if (!_live)
+                {
+                    throw new InvalidOperationException(
+                        "ZEN live stream ended before a fresh frame arrived. Capture aborted to avoid stale data.");
+                }
+
+                if (_lastFrame is not null && _lastFrame.CapturedAt > threshold)
+                    return _lastFrame;
+            }
+
+            await Task.Delay(20, cancellationToken).ConfigureAwait(false);
+        }
+
+        throw new TimeoutException(
+            "Timed out waiting for a fresh ZEN frame after the stage move. Capture aborted to avoid stale data.");
     }
 
     private async Task StreamLoopAsync(
@@ -262,15 +304,6 @@ public sealed class ZenApiCameraService : ICameraService, IZenClient, IAsyncDisp
             PixelFormat = format,
             CapturedAt = DateTimeOffset.UtcNow,
         };
-    }
-
-    private CameraFrame GetLastFrameOrThrow()
-    {
-        lock (_gate)
-        {
-            return _lastFrame
-                ?? throw new InvalidOperationException("No live frame available. Start live, then capture.");
-        }
     }
 
     private void SetStatus(string status)
