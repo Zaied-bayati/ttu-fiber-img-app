@@ -33,8 +33,14 @@ public sealed class SessionExportService : ISessionExportService
 
         Directory.CreateDirectory(root);
 
-        var folderName = session.StartedAt.ToLocalTime().ToString("yyyy-MM-dd_HH-mm-ss");
+        // Include session Id so two saves in the same clock second cannot overwrite each other.
+        var folderName = $"{session.StartedAt.ToLocalTime():yyyy-MM-dd_HH-mm-ss}_{session.Id:N}";
         var sessionDir = Path.Combine(root, folderName);
+        if (Directory.Exists(sessionDir))
+        {
+            throw new IOException($"Session folder already exists: {sessionDir}");
+        }
+
         Directory.CreateDirectory(sessionDir);
 
         var kept = session.Images.Where(i => i.Keep).OrderBy(i => i.Index).ToList();

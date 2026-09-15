@@ -41,40 +41,53 @@ public sealed class SamplingService : ISamplingService
             RequestedCount = imageCount
         };
 
-        for (var i = 0; i < positions.Count; i++)
+        try
         {
-            cancellationToken.ThrowIfCancellationRequested();
-            var position = positions[i];
-            var imageNumber = i + 1;
-
-            progress?.Report(new SamplingProgress
+            for (var i = 0; i < positions.Count; i++)
             {
-                CurrentIndex = imageNumber,
-                TotalCount = imageCount,
-                PositionMm = position,
-                Message = $"Moving to {position:0.###} mm (image {imageNumber} of {imageCount})…"
-            });
+                cancellationToken.ThrowIfCancellationRequested();
+                var position = positions[i];
+                var imageNumber = i + 1;
 
-            _logger.LogInformation("Sampling move to {Position} mm ({Index}/{Total})", position, imageNumber, imageCount);
-            await _stage.MoveAbsoluteAsync(position, cancellationToken).ConfigureAwait(false);
+                progress?.Report(new SamplingProgress
+                {
+                    CurrentIndex = imageNumber,
+                    TotalCount = imageCount,
+                    PositionMm = position,
+                    Message = $"Moving to {position:0.###} mm (image {imageNumber} of {imageCount})…"
+                });
 
-            progress?.Report(new SamplingProgress
-            {
-                CurrentIndex = imageNumber,
-                TotalCount = imageCount,
-                PositionMm = position,
-                Message = $"Capturing image {imageNumber} of {imageCount} at {position:0.###} mm…"
-            });
+                _logger.LogInformation("Sampling move to {Position} mm ({Index}/{Total})", position, imageNumber, imageCount);
+                await _stage.MoveAbsoluteAsync(position, cancellationToken).ConfigureAwait(false);
 
-            var png = await _camera.CaptureStillAsync(cancellationToken).ConfigureAwait(false);
-            session.Images.Add(new CapturedImage
-            {
-                Index = imageNumber,
-                PositionMm = position,
-                CapturedAt = DateTimeOffset.Now,
-                PngBytes = png,
-                Keep = true
-            });
+                progress?.Report(new SamplingProgress
+                {
+                    CurrentIndex = imageNumber,
+                    TotalCount = imageCount,
+                    PositionMm = position,
+                    Message = $"Capturing image {imageNumber} of {imageCount} at {position:0.###} mm…"
+                });
+
+                var png = await _camera.CaptureStillAsync(cancellationToken).ConfigureAwait(false);
+                session.Images.Add(new CapturedImage
+                {
+                    Index = imageNumber,
+                    PositionMm = position,
+                    CapturedAt = DateTimeOffset.Now,
+                    PngBytes = png,
+                    Keep = true
+                });
+            }
+        }
+        catch (Exception ex) when (session.Images.Count > 0)
+        {
+            // Preserve already-acquired captures so the UI can offer review/save instead of data loss.
+            _logger.LogWarning(
+                ex,
+                "Sampling stopped early with {Captured}/{Requested} images",
+                session.Images.Count,
+                imageCount);
+            throw new SamplingIncompleteException(session, ex);
         }
 
         progress?.Report(new SamplingProgress

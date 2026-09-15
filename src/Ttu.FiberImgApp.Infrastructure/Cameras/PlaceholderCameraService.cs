@@ -87,7 +87,9 @@ public sealed class PlaceholderCameraService : ICameraService
 
     public Task<byte[]> CaptureStillAsync(CancellationToken cancellationToken = default)
     {
-        var frame = GetOrCreateFrame();
+        // Always synthesize a new frame so rapid sampling does not reuse a pre-move preview buffer.
+        var frame = CreateFrame();
+        lock (_gate) _lastFrame = frame;
         return Task.FromResult(MonoFrameEncoder.ToPng(frame));
     }
 

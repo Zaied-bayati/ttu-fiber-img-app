@@ -341,13 +341,17 @@ public partial class CaptureViewModel : ObservableObject
                 progress,
                 _runCts.Token);
 
-            foreach (var image in CurrentSession.Images)
-            {
-                ReviewImages.Add(new ReviewImageItem(image, await ToBitmapAsync(image.PngBytes)));
-            }
-
-            IsReviewVisible = true;
+            await ShowReviewAsync(CurrentSession).ConfigureAwait(true);
             ProgressMessage = $"Done — {CurrentSession.Images.Count} images. Double-click a tile to fullscreen.";
+        }
+        catch (SamplingIncompleteException ex)
+        {
+            CurrentSession = ex.Session;
+            await ShowReviewAsync(ex.Session).ConfigureAwait(true);
+            if (ex.InnerException is not OperationCanceledException)
+                BannerMessage = ex.InnerException?.Message ?? ex.Message;
+            ProgressMessage =
+                $"{ex.Message} Double-click a tile to fullscreen — you can still save what was captured.";
         }
         catch (OperationCanceledException)
         {
@@ -363,6 +367,17 @@ public partial class CaptureViewModel : ObservableObject
             IsBusy = false;
             RefreshStatus();
         }
+    }
+
+    private async Task ShowReviewAsync(SamplingSession session)
+    {
+        ReviewImages.Clear();
+        foreach (var image in session.Images)
+        {
+            ReviewImages.Add(new ReviewImageItem(image, await ToBitmapAsync(image.PngBytes).ConfigureAwait(true)));
+        }
+
+        IsReviewVisible = true;
     }
 
     [RelayCommand]
