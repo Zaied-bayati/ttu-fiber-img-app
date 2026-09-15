@@ -23,6 +23,9 @@ public sealed partial class ShellPage : Page
                 case "settings":
                     ContentFrame.Navigate(typeof(SettingsPage));
                     break;
+                case "activity":
+                    ContentFrame.Navigate(typeof(ActivityPage));
+                    break;
             }
         }
     }

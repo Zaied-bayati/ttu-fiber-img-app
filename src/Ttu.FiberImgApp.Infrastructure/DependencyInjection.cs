@@ -6,6 +6,7 @@ using Serilog.Events;
 using Ttu.FiberImgApp.Core.Abstractions;
 using Ttu.FiberImgApp.Core.Configuration;
 using Ttu.FiberImgApp.Infrastructure.Data;
+using Ttu.FiberImgApp.Infrastructure.Diagnostics;
 using Ttu.FiberImgApp.Infrastructure.Sampling;
 
 namespace Ttu.FiberImgApp.Infrastructure;
@@ -42,6 +43,7 @@ public static class DependencyInjection
             state.LoadFrom(thorlabs, capture);
             return state;
         });
+        services.AddSingleton<IActivityLog, ActivityLogService>();
         services.AddSingleton<ISamplingService, SamplingService>();
         services.AddSingleton<ISessionExportService, SessionExportService>();
 

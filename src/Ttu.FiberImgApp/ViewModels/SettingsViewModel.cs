@@ -16,6 +16,7 @@ public partial class SettingsViewModel : ObservableObject
     private readonly ThorlabsOptions _thorlabsOptions;
     private readonly CaptureOptions _captureOptions;
     private readonly ZenOptions _zenOptions;
+    private readonly IActivityLog _log;
 
     public SettingsViewModel(
         IThorlabsClient stage,
@@ -23,7 +24,8 @@ public partial class SettingsViewModel : ObservableObject
         AppSettingsState settings,
         IOptions<ThorlabsOptions> thorlabsOptions,
         IOptions<CaptureOptions> captureOptions,
-        IOptions<ZenOptions> zenOptions)
+        IOptions<ZenOptions> zenOptions,
+        IActivityLog log)
     {
         _stage = stage;
         _camera = camera;
@@ -31,6 +33,7 @@ public partial class SettingsViewModel : ObservableObject
         _thorlabsOptions = thorlabsOptions.Value;
         _captureOptions = captureOptions.Value;
         _zenOptions = zenOptions.Value;
+        _log = log;
         _settings.LoadFrom(_thorlabsOptions, _captureOptions);
         LoadFromState();
         StageStatus = _stage.Status;
@@ -155,6 +158,7 @@ public partial class SettingsViewModel : ObservableObject
             await _stage.ApplyMotionParametersAsync(VelocityMmPerSec, AccelerationMmPerSec2);
             await WriteLocalSettingsFileAsync();
             Message = "Settings saved to LocalAppData. Restart the app after changing simulator / ZEN host options.";
+            _log.Write("settings", Message);
         }
         catch (Exception ex)
         {
@@ -171,11 +175,13 @@ public partial class SettingsViewModel : ObservableObject
         PushToState();
         IsBusy = true;
         Message = string.Empty;
+        _log.Write("settings", "Connect stage...");
         try
         {
             await _stage.ApplyMotionParametersAsync(VelocityMmPerSec, AccelerationMmPerSec2);
             var ok = await _stage.ConnectAsync();
             Message = ok ? "Stage connected." : "Stage connect failed — see status.";
+            _log.Write("settings", $"{Message} | {_stage.Status}");
         }
         catch (Exception ex)
         {
@@ -201,10 +207,12 @@ public partial class SettingsViewModel : ObservableObject
     {
         PushToState();
         IsBusy = true;
+        _log.Write("settings", "Connect camera...");
         try
         {
             var ok = await _camera.ConnectAsync();
             Message = ok ? "Camera connected." : "Camera connect failed — check ZEN settings / restart if you flipped simulator.";
+            _log.Write("settings", $"{Message} | {_camera.Status}");
         }
         catch (Exception ex)
         {

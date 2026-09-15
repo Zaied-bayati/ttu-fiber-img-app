@@ -10,15 +10,18 @@ public sealed class SamplingService : ISamplingService
     private readonly IThorlabsClient _stage;
     private readonly ICameraService _camera;
     private readonly ILogger<SamplingService> _logger;
+    private readonly IActivityLog _activityLog;
 
     public SamplingService(
         IThorlabsClient stage,
         ICameraService camera,
-        ILogger<SamplingService> logger)
+        ILogger<SamplingService> logger,
+        IActivityLog activityLog)
     {
         _stage = stage;
         _camera = camera;
         _logger = logger;
+        _activityLog = activityLog;
     }
 
     public async Task<SamplingSession> RunAsync(
@@ -58,6 +61,7 @@ public sealed class SamplingService : ISamplingService
                 });
 
                 _logger.LogInformation("Sampling move to {Position} mm ({Index}/{Total})", position, imageNumber, imageCount);
+                _activityLog.Write("sample", $"Move to {position:0.###} mm (image {imageNumber}/{imageCount})");
                 await _stage.MoveAbsoluteAsync(position, cancellationToken).ConfigureAwait(false);
 
                 progress?.Report(new SamplingProgress
@@ -69,6 +73,7 @@ public sealed class SamplingService : ISamplingService
                 });
 
                 var png = await _camera.CaptureStillAsync(cancellationToken).ConfigureAwait(false);
+                _activityLog.Write("sample", $"Captured image {imageNumber}/{imageCount} ({png.Length} bytes)");
                 session.Images.Add(new CapturedImage
                 {
                     Index = imageNumber,

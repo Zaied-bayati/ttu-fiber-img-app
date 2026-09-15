@@ -13,7 +13,7 @@ public sealed class SamplingServiceTests
     {
         var stage = new FakeStage();
         var camera = new FakeCamera { FailAfterCaptures = 2 };
-        var sut = new SamplingService(stage, camera, NullLogger<SamplingService>.Instance);
+        var sut = new SamplingService(stage, camera, NullLogger<SamplingService>.Instance, NullActivityLog.Instance);
         using var cts = new CancellationTokenSource();
 
         camera.OnCapture = count =>
@@ -35,7 +35,7 @@ public sealed class SamplingServiceTests
     {
         var stage = new FakeStage();
         var camera = new FakeCamera { ThrowOnCaptureIndex = 3 };
-        var sut = new SamplingService(stage, camera, NullLogger<SamplingService>.Instance);
+        var sut = new SamplingService(stage, camera, NullLogger<SamplingService>.Instance, NullActivityLog.Instance);
 
         var ex = await Assert.ThrowsAsync<SamplingIncompleteException>(() =>
             sut.RunAsync(5, 0, 10));
@@ -49,9 +49,20 @@ public sealed class SamplingServiceTests
     {
         var stage = new FakeStage { ThrowOnMove = true };
         var camera = new FakeCamera();
-        var sut = new SamplingService(stage, camera, NullLogger<SamplingService>.Instance);
+        var sut = new SamplingService(stage, camera, NullLogger<SamplingService>.Instance, NullActivityLog.Instance);
 
         await Assert.ThrowsAsync<InvalidOperationException>(() => sut.RunAsync(3, 0, 10));
+    }
+
+    private sealed class NullActivityLog : IActivityLog
+    {
+        public static NullActivityLog Instance { get; } = new();
+        public event EventHandler? Changed;
+        public IReadOnlyList<string> Lines => Array.Empty<string>();
+        public string Text => string.Empty;
+        public void Write(string message) { }
+        public void Write(string category, string message) { }
+        public void Clear() { }
     }
 
     private sealed class FakeStage : IThorlabsClient
@@ -78,6 +89,8 @@ public sealed class SamplingServiceTests
             PositionMm = positionMm;
             return Task.CompletedTask;
         }
+
+        public Task RefreshPositionAsync(CancellationToken cancellationToken = default) => Task.CompletedTask;
 
         public IReadOnlyList<string> ListDevices() => Array.Empty<string>();
     }

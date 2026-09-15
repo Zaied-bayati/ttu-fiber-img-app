@@ -216,7 +216,7 @@ Or run **Release MSIX** via Actions → **workflow_dispatch** and enter `0.1.0.0
    - Travel defaults **0–100 mm** (NRT100). Adjust min/max if needed.
    - Set velocity / acceleration, then **Save settings**.
 4. **Connect** in Settings or Capture, then use manual jog / Begin Sampling.
-5. Real XA binding: `XaThorlabsClient` loads SDK DLLs from `C:\Program Files\Thorlabs\XA` when `UseSimulator` is false. If connect fails, check serial/channel and finish SDK wiring using Thorlabs XA examples on the lab PC.
+5. Real XA binding: `XaThorlabsClient` loads SDK DLLs from `C:\Program Files\Thorlabs XA` (and a few fallback folders) when `UseSimulator` is false. If connect fails, check serial/channel and finish SDK wiring using Thorlabs XA examples on the lab PC.
 
 ### Zeiss ZEN API (Axiocam 820 mono)
 

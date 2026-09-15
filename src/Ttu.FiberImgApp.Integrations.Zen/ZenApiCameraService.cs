@@ -19,6 +19,7 @@ public sealed class ZenApiCameraService : ICameraService, IZenClient, IAsyncDisp
 {
     private readonly ZenOptions _options;
     private readonly ILogger<ZenApiCameraService> _logger;
+    private readonly IActivityLog _activityLog;
     private readonly object _gate = new();
 
     private GrpcChannel? _channel;
@@ -33,10 +34,11 @@ public sealed class ZenApiCameraService : ICameraService, IZenClient, IAsyncDisp
     private bool _connected;
     private bool _live;
 
-    public ZenApiCameraService(IOptions<ZenOptions> options, ILogger<ZenApiCameraService> logger)
+    public ZenApiCameraService(IOptions<ZenOptions> options, ILogger<ZenApiCameraService> logger, IActivityLog activityLog)
     {
         _options = options.Value;
         _logger = logger;
+        _activityLog = activityLog;
     }
 
     public string Status { get { lock (_gate) return _status; } }
@@ -309,6 +311,7 @@ public sealed class ZenApiCameraService : ICameraService, IZenClient, IAsyncDisp
     private void SetStatus(string status)
     {
         lock (_gate) _status = status;
+        _activityLog.Write("zen", status);
     }
 
     private async Task DisposeChannelAsync()

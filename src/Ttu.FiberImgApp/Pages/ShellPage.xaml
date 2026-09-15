@@ -24,6 +24,11 @@
                     <FontIcon Glyph="&#xE713;" />
                 </NavigationViewItem.Icon>
             </NavigationViewItem>
+            <NavigationViewItem Content="Serial monitor" Tag="activity">
+                <NavigationViewItem.Icon>
+                    <FontIcon Glyph="&#xE8A5;" />
+                </NavigationViewItem.Icon>
+            </NavigationViewItem>
         </NavigationView.MenuItems>
         <Frame x:Name="ContentFrame" />
     </NavigationView>

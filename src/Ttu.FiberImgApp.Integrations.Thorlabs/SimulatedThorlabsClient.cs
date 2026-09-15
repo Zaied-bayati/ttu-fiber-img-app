@@ -1,4 +1,3 @@
-using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Ttu.FiberImgApp.Core.Abstractions;
@@ -12,6 +11,7 @@ namespace Ttu.FiberImgApp.Integrations.Thorlabs;
 public sealed class SimulatedThorlabsClient : IThorlabsClient
 {
     private readonly ThorlabsOptions _options;
+    private readonly IActivityLog _activityLog;
     private readonly ILogger<SimulatedThorlabsClient> _logger;
     private readonly object _gate = new();
     private double _positionMm;
@@ -20,10 +20,14 @@ public sealed class SimulatedThorlabsClient : IThorlabsClient
     private bool _connected;
     private bool _moving;
 
-    public SimulatedThorlabsClient(IOptions<ThorlabsOptions> options, ILogger<SimulatedThorlabsClient> logger)
+    public SimulatedThorlabsClient(
+        IOptions<ThorlabsOptions> options,
+        ILogger<SimulatedThorlabsClient> logger,
+        IActivityLog activityLog)
     {
         _options = options.Value;
         _logger = logger;
+        _activityLog = activityLog;
         _positionMm = _options.MinMm;
         _velocity = _options.VelocityMmPerSec;
         _acceleration = _options.AccelerationMmPerSec2;
@@ -45,6 +49,7 @@ public sealed class SimulatedThorlabsClient : IThorlabsClient
     public Task<bool> ConnectAsync(CancellationToken cancellationToken = default)
     {
         _connected = true;
+        _activityLog.Write("thorlabs", Status);
         _logger.LogInformation("Simulated Thorlabs stage connected");
         return Task.FromResult(true);
     }
@@ -108,6 +113,8 @@ public sealed class SimulatedThorlabsClient : IThorlabsClient
         _options.AccelerationMmPerSec2 = _acceleration;
         return Task.CompletedTask;
     }
+
+    public Task RefreshPositionAsync(CancellationToken cancellationToken = default) => Task.CompletedTask;
 
     private void EnsureConnected()
     {

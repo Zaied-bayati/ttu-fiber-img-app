@@ -9,7 +9,13 @@ namespace Ttu.FiberImgApp.Infrastructure.Cameras;
 /// </summary>
 public sealed class PlaceholderCameraService : ICameraService
 {
+    private readonly IActivityLog _activityLog;
     private readonly object _gate = new();
+
+    public PlaceholderCameraService(IActivityLog activityLog)
+    {
+        _activityLog = activityLog;
+    }
     private bool _connected;
     private bool _live;
     private CancellationTokenSource? _liveCts;
@@ -39,6 +45,7 @@ public sealed class PlaceholderCameraService : ICameraService
     public Task<bool> ConnectAsync(CancellationToken cancellationToken = default)
     {
         lock (_gate) _connected = true;
+        _activityLog.Write("camera", Status);
         return Task.FromResult(true);
     }
 
@@ -55,6 +62,7 @@ public sealed class PlaceholderCameraService : ICameraService
             if (!_connected) throw new InvalidOperationException("Connect the camera first.");
             if (_live) return Task.CompletedTask;
             _live = true;
+            _activityLog.Write("camera", "Simulator live started");
             _liveCts = new CancellationTokenSource();
             var token = _liveCts.Token;
             _liveLoop = Task.Run(() => LiveLoopAsync(token), token);

@@ -11,7 +11,20 @@
 
     <ScrollViewer Padding="20">
         <StackPanel Spacing="16" MaxWidth="1100">
-            <TextBlock Text="Capture" Style="{StaticResource TitleTextBlockStyle}" />
+            <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="Auto" />
+                </Grid.ColumnDefinitions>
+                <TextBlock Text="Capture" Style="{StaticResource TitleTextBlockStyle}" />
+                <TextBlock
+                    Grid.Column="1"
+                    Text="{x:Bind ViewModel.StagePositionDisplay, Mode=OneWay}"
+                    Style="{StaticResource SubtitleTextBlockStyle}"
+                    FontFamily="Consolas"
+                    VerticalAlignment="Center"
+                    Margin="16,0,0,0" />
+            </Grid>
             <InfoBar
                 IsOpen="{x:Bind ViewModel.HasBanner, Mode=OneWay}"
                 Severity="Warning"
