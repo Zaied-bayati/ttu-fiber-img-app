@@ -17,7 +17,9 @@
             <TextBlock Text="Zeiss ZEN / Axiocam" Style="{StaticResource SubtitleTextBlockStyle}" />
             <ToggleSwitch Header="Use ZEN simulator (no Gateway)" IsOn="{x:Bind ViewModel.ZenUseSimulator, Mode=TwoWay}" />
             <TextBox Header="Gateway host" Text="{x:Bind ViewModel.ZenHost, Mode=TwoWay}" />
-            <NumberBox Header="Gateway port" Value="{x:Bind ViewModel.ZenPort, Mode=TwoWay}" Minimum="1" Maximum="65535" SpinButtonPlacementMode="Inline" />
+            <NumberBox Header="Gateway port (match Gateway UI — often 50051 or 5002)" Value="{x:Bind ViewModel.ZenPort, Mode=TwoWay}" Minimum="1" Maximum="65535" SpinButtonPlacementMode="Inline" />
+            <TextBlock Opacity="0.75" TextWrapping="WrapWholeWords"
+                       Text="Use the Gateway port from ZEN API Gateway (not Zen Client/Service ports like 5024/5025). Save and restart the app after changing port." />
             <TextBox Header="Experiment name (no .czexp)" Text="{x:Bind ViewModel.ZenExperimentName, Mode=TwoWay}" />
             <PasswordBox x:Name="ZenTokenBox" Header="API control token" PasswordChanged="ZenTokenBox_PasswordChanged" />
             <TextBox Header="Gateway certificate path (optional .pem/.crt)" Text="{x:Bind ViewModel.ZenCertificatePath, Mode=TwoWay}" TextWrapping="Wrap" />

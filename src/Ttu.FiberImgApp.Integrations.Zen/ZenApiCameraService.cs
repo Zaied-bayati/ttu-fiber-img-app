@@ -83,7 +83,11 @@ public sealed class ZenApiCameraService : ICameraService, IZenClient, IAsyncDisp
                 _connected = true;
             }
 
-            SetStatus($"ZEN connected - experiment '{_options.ExperimentName}'");
+            // Ensure we don't inherit a Live session left running from a previous attempt.
+            await TryStopExperimentAsync(_experiment, _metadata, load.ExperimentId, cancellationToken)
+                .ConfigureAwait(false);
+
+            SetStatus($"ZEN connected - experiment '{_options.ExperimentName}' (gateway {_options.Host}:{_options.Port})");
             return true;
         }
         catch (Exception ex)
@@ -125,7 +129,9 @@ public sealed class ZenApiCameraService : ICameraService, IZenClient, IAsyncDisp
             metadata = _metadata;
         }
 
-        // Subscribe to the pixel stream before StartLive so ROI/partial frames are not missed.
+        // Clear a leftover Live/Continuous from a prior Start live (causes "same ID is already active").
+        await TryStopExperimentAsync(experiment, metadata, experimentId, cancellationToken).ConfigureAwait(false);
+
         var cts = new CancellationTokenSource();
         var streamReady = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var firstFrame = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -146,57 +152,134 @@ public sealed class ZenApiCameraService : ICameraService, IZenClient, IAsyncDisp
             }
             catch (TimeoutException)
             {
-                SetStatus("ZEN: timed out opening MonitorExperiment stream");
+                SetStatus("ZEN: timed out opening pixel monitor stream");
             }
 
-            // Zeiss examples always pass track_index=0 for StartLive (mono / first track).
-            await experiment.StartLiveAsync(
-                new ExperimentServiceStartLiveRequest
-                {
-                    ExperimentId = experimentId,
-                    TrackIndex = 0,
-                },
-                headers: metadata,
-                cancellationToken: cancellationToken).ResponseAsync.ConfigureAwait(false);
-
+            await StartAcquisitionAsync(experiment, metadata, experimentId, live: true, cancellationToken)
+                .ConfigureAwait(false);
             SetStatus("ZEN live started — waiting for frames...");
 
-            try
+            if (await WaitForFirstFrameAsync(firstFrame, TimeSpan.FromSeconds(6), cancellationToken).ConfigureAwait(false))
             {
-                await firstFrame.Task.WaitAsync(TimeSpan.FromSeconds(5), cancellationToken).ConfigureAwait(false);
                 SetStatus("ZEN live running");
                 return;
             }
-            catch (TimeoutException)
-            {
-                SetStatus("ZEN StartLive: no frames yet — trying StartContinuous...");
-            }
 
-            // Some ZEN core profiles stream pixels under Continuous rather than Live.
-            await experiment.StartContinuousAsync(
-                new ExperimentServiceStartContinuousRequest { ExperimentId = experimentId },
-                headers: metadata,
-                cancellationToken: cancellationToken).ResponseAsync.ConfigureAwait(false);
+            // StartLive left the experiment active — must Stop before Continuous.
+            SetStatus("ZEN StartLive: no frames — stopping, then StartContinuous...");
+            await TryStopExperimentAsync(experiment, metadata, experimentId, cancellationToken).ConfigureAwait(false);
 
+            await StartAcquisitionAsync(experiment, metadata, experimentId, live: false, cancellationToken)
+                .ConfigureAwait(false);
             SetStatus("ZEN continuous started — waiting for frames...");
 
-            try
+            if (await WaitForFirstFrameAsync(firstFrame, TimeSpan.FromSeconds(8), cancellationToken).ConfigureAwait(false))
             {
-                await firstFrame.Task.WaitAsync(TimeSpan.FromSeconds(8), cancellationToken).ConfigureAwait(false);
                 SetStatus("ZEN live running (continuous)");
+                return;
             }
-            catch (TimeoutException)
-            {
-                SetStatus(
-                    "ZEN acquisition started but no pixel frames arrived. " +
-                    "In ZEN: enable API/unsupervised mode if available, stop UI Live, " +
-                    "confirm Gateway shows ZEN as provider, then retry.");
-            }
+
+            SetStatus(
+                "ZEN acquisition started but no pixel frames arrived. " +
+                "Confirm Fiber Img App Gateway port matches the Gateway UI (often 50051 or 5002), " +
+                "stop Live in ZEN, enable API mode if available, then retry.");
         }
         catch
         {
             await StopLiveAsync(CancellationToken.None).ConfigureAwait(false);
             throw;
+        }
+    }
+
+    private static async Task<bool> WaitForFirstFrameAsync(
+        TaskCompletionSource firstFrame,
+        TimeSpan timeout,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            await firstFrame.Task.WaitAsync(timeout, cancellationToken).ConfigureAwait(false);
+            return true;
+        }
+        catch (TimeoutException)
+        {
+            return false;
+        }
+    }
+
+    private async Task StartAcquisitionAsync(
+        ExperimentService.ExperimentServiceClient experiment,
+        Metadata metadata,
+        string experimentId,
+        bool live,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            if (live)
+            {
+                await experiment.StartLiveAsync(
+                    new ExperimentServiceStartLiveRequest
+                    {
+                        ExperimentId = experimentId,
+                        TrackIndex = 0,
+                    },
+                    headers: metadata,
+                    cancellationToken: cancellationToken).ResponseAsync.ConfigureAwait(false);
+            }
+            else
+            {
+                await experiment.StartContinuousAsync(
+                    new ExperimentServiceStartContinuousRequest { ExperimentId = experimentId },
+                    headers: metadata,
+                    cancellationToken: cancellationToken).ResponseAsync.ConfigureAwait(false);
+            }
+        }
+        catch (RpcException ex) when (IsAlreadyActive(ex))
+        {
+            SetStatus("ZEN: experiment already active — stopping and retrying...");
+            await TryStopExperimentAsync(experiment, metadata, experimentId, cancellationToken).ConfigureAwait(false);
+            if (live)
+            {
+                await experiment.StartLiveAsync(
+                    new ExperimentServiceStartLiveRequest
+                    {
+                        ExperimentId = experimentId,
+                        TrackIndex = 0,
+                    },
+                    headers: metadata,
+                    cancellationToken: cancellationToken).ResponseAsync.ConfigureAwait(false);
+            }
+            else
+            {
+                await experiment.StartContinuousAsync(
+                    new ExperimentServiceStartContinuousRequest { ExperimentId = experimentId },
+                    headers: metadata,
+                    cancellationToken: cancellationToken).ResponseAsync.ConfigureAwait(false);
+            }
+        }
+    }
+
+    private static bool IsAlreadyActive(RpcException ex) =>
+        ex.Status.Detail.Contains("already active", StringComparison.OrdinalIgnoreCase)
+        || ex.Message.Contains("already active", StringComparison.OrdinalIgnoreCase);
+
+    private async Task TryStopExperimentAsync(
+        ExperimentService.ExperimentServiceClient experiment,
+        Metadata metadata,
+        string experimentId,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            await experiment.StopAsync(
+                new ExperimentServiceStopRequest { ExperimentId = experimentId },
+                headers: metadata,
+                cancellationToken: cancellationToken).ResponseAsync.ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "ZEN Stop before start (ignored if nothing was running)");
         }
     }
 
