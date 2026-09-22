@@ -39,6 +39,8 @@ public sealed class ZenApiCameraService : ICameraService, IZenClient, IAsyncDisp
     private bool _connected;
     private bool _live;
     private volatile bool _frameTooLarge;
+    private int _streamMessages;
+    private string _lastSkip = string.Empty;
 
     public ZenApiCameraService(IOptions<ZenOptions> options, ILogger<ZenApiCameraService> logger, IActivityLog activityLog)
     {
@@ -166,6 +168,8 @@ public sealed class ZenApiCameraService : ICameraService, IZenClient, IAsyncDisp
             streaming = _streaming;
             metadata = _metadata;
             _frameTooLarge = false;
+            _streamMessages = 0;
+            _lastSkip = string.Empty;
         }
 
         await TryStopExperimentAsync(experiment, metadata, experimentId, cancellationToken).ConfigureAwait(false);
@@ -212,10 +216,11 @@ public sealed class ZenApiCameraService : ICameraService, IZenClient, IAsyncDisp
             if (_frameTooLarge)
                 throw new InvalidOperationException(Status);
 
-            const string noFrames =
-                "ZEN acquisition started but no pixel frames arrived. " +
-                "Enable Unsupervised API Mode in ZEN (Tools → Options → ZEN API), stop Live in the ZEN window, " +
-                "and confirm the experiment uses the Axiocam. Then start live again.";
+            var noFrames = _streamMessages == 0
+                ? "ZEN acquisition started but the Gateway sent 0 pixel messages. " +
+                  "Leave Live running in ZEN (the image must be updating there), then press Start live again. " +
+                  "Also confirm Unsupervised API Mode is on and this experiment's active track is the Axiocam."
+                : $"ZEN sent {_streamMessages} stream messages but no displayable image ({_lastSkip}).";
             await StopLiveAsync(CancellationToken.None).ConfigureAwait(false);
             SetStatus(noFrames);
         }
@@ -381,12 +386,10 @@ public sealed class ZenApiCameraService : ICameraService, IZenClient, IAsyncDisp
     {
         if (live)
         {
+            // Omit track index so ZEN uses the activated camera track.
+            // Forcing 0 selects an empty track when the Axiocam is not track 0, and live then has no pixels.
             return experiment.StartLiveAsync(
-                new ExperimentServiceStartLiveRequest
-                {
-                    ExperimentId = experimentId,
-                    TrackIndex = 0,
-                },
+                new ExperimentServiceStartLiveRequest { ExperimentId = experimentId },
                 headers: metadata,
                 cancellationToken: cancellationToken).ResponseAsync;
         }
@@ -404,14 +407,13 @@ public sealed class ZenApiCameraService : ICameraService, IZenClient, IAsyncDisp
         CancellationToken liveToken,
         CancellationToken cancellationToken)
     {
-        // Zeiss' own viewer subscribes after acquisition is running and asks for full frames
-        // (enable_raw_data = false). Scan-line mode is the fallback.
-        var attempts = new (bool AllExperiments, bool EnableRawData, string Label)[]
+        // LM cameras (Axiocam) emit a full frame per message. Cancelling the stream every few
+        // seconds aborts that transfer before gRPC can deliver it, which looks like "no pixels".
+        var attempts = new (bool AllExperiments, bool EnableRawData, string Label, TimeSpan Timeout)[]
         {
-            (false, false, "MonitorExperiment full frames"),
-            (false, true, "MonitorExperiment raw scan lines"),
-            (true, false, "MonitorAllExperiments full frames"),
-            (true, true, "MonitorAllExperiments raw scan lines"),
+            (false, true, "MonitorExperiment", TimeSpan.FromSeconds(20)),
+            (true, true, "MonitorAllExperiments", TimeSpan.FromSeconds(15)),
+            (false, false, "MonitorExperiment assembled frames", TimeSpan.FromSeconds(12)),
         };
 
         foreach (var attempt in attempts)
@@ -427,12 +429,14 @@ public sealed class ZenApiCameraService : ICameraService, IZenClient, IAsyncDisp
                 experimentId,
                 attempt.AllExperiments,
                 attempt.EnableRawData,
-                TimeSpan.FromSeconds(4),
+                attempt.Timeout,
                 liveToken,
                 cancellationToken).ConfigureAwait(false);
 
             if (hit == MonitorHit.Frame)
                 return true;
+            if (hit == MonitorHit.NeedRawData)
+                continue;
         }
 
         return false;
@@ -599,13 +603,20 @@ public sealed class ZenApiCameraService : ICameraService, IZenClient, IAsyncDisp
 
     private void Publish(FrameData? data, string sourceName, bool enableRawData, TaskCompletionSource<MonitorHit> first)
     {
+        var count = Interlocked.Increment(ref _streamMessages);
         var frame = _assembler.Add(data, out var skipReason);
         if (frame is null)
         {
-            if (!enableRawData && skipReason.Contains("RawData is empty", StringComparison.Ordinal))
+            if (!string.IsNullOrEmpty(skipReason))
+                _lastSkip = skipReason;
+
+            // One empty prelude is normal. Leave the stream open so the following full frame can arrive.
+            if (skipReason.Contains("RawData is empty", StringComparison.Ordinal) && count >= (enableRawData ? 40 : 8))
                 first.TrySetResult(MonitorHit.NeedRawData);
-            else if (!string.IsNullOrEmpty(skipReason) && !skipReason.StartsWith("buffering", StringComparison.Ordinal))
-                _logger.LogDebug("ZEN {Source} skipped frame: {Reason}", sourceName, skipReason);
+            else if (!string.IsNullOrEmpty(skipReason)
+                     && !skipReason.StartsWith("buffering", StringComparison.Ordinal)
+                     && count is 1 or 10 or 50)
+                SetStatus($"ZEN {sourceName} message {count}: {skipReason}");
             return;
         }
 
