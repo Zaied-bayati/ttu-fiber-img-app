@@ -220,19 +220,21 @@ Or run **Release MSIX** via Actions → **workflow_dispatch** and enter `0.1.0.0
 
 ### Zeiss ZEN API (Axiocam 820 mono)
 
-Prerequisites: **ZEN Blue or ZEN core 3.11+**, **ZEN API Gateway** (install via ZEISS Microscopy Installer / ZMI), and a control token. The Axiocam 820 is selected inside a ZEN experiment — this app talks to the Gateway over gRPC (TLS), not USB directly.
+Prerequisites: **ZEN Blue or ZEN core 3.11+**, **ZEN API Gateway** (install via ZEISS Microscopy Installer / ZMI), and a control token. Live view is supported. The Axiocam stays owned by ZEN; this app does not open the camera over USB. ZEN acquires, and the Gateway streams pixels to the app over gRPC (HTTP/2 + TLS).
 
 1. Install ZEN (3.11+) and the **ZEN API Gateway**. Optionally install the ZEN API proto files (`C:\Users\Public\Documents\Carl Zeiss\ZEN API Proto Files`) for reference.
-2. In ZEN, create and save a live/snap experiment that uses the **Axiocam 820 mono**. Note the experiment name **without** the `.czexp` extension.
-3. Create an API **control token** in the Gateway / ZEN API tooling.
-4. Trust the Gateway TLS certificate on this PC (or set `Zen:CertificatePath` to the CA `.pem`/`.crt`, or temporarily `Zen:AllowUntrustedCertificate` for lab bring-up only).
-5. In Fiber Img App **Settings → Zeiss ZEN / Axiocam**:
+2. In ZEN Blue open **Tools → Options → ZEN API** and enable **Unsupervised API Mode**. Without that, ZEN rejects `StartLive` / `StartContinuous` ("controlling methods are not allowed"). You can still start Live in the ZEN window; the app will display that stream.
+3. In ZEN, create and save a live/snap experiment that uses the **Axiocam 820 mono**. Note the experiment name **without** the `.czexp` extension.
+4. Copy the Gateway **control token** from the Gateway tray icon, or leave the token blank in the app. A blank token is read from `C:\ProgramData\Carl Zeiss\ZEN APIGateway\GlobalControlToken.txt`.
+5. The Gateway listens on **port 5002** unless its own `appsettings.json` changes it (tray icon shows the real port). Do not use the ZEN Client/Service ports (often 5024/5025). The app tries the saved port, then 5002, 50051, and 5000.
+6. TLS uses the Gateway CA when it is present (`C:\ProgramData\Carl Zeiss\ZenApiGateway\Certificates\ZenApiPersonalSigningRootCA.pem`, and the spaced `ZEN APIGateway` folder). On localhost the app still connects if that file is missing. Set `Zen:CertificatePath` or **Allow untrusted certificate** for a remote gateway.
+7. In Fiber Img App **Settings → Zeiss ZEN / Axiocam**:
    - Turn **off** "Use ZEN simulator".
-   - Set host (usually `localhost`), port (default `50051`), experiment name, and paste the control token.
-   - **Save settings**, then **restart the app** (DI picks simulator vs real client at startup).
-6. On **Capture**: Connect camera → Start live. Double-click the preview (or Fullscreen live) for a zoomable viewer (scroll wheel / Zoom ± / Esc).
-7. Sampling stills use the **latest live frame** encoded as PNG (no CZI dependency in this version).
-8. If live fails with a busy / conflict error, stop Live in the ZEN UI so the Gateway can start live from this app.
+   - Set host (usually `localhost`), port (`5002`), experiment name, and the control token if you do not want the file default.
+   - **Save settings**, then **restart the app** (simulator vs real client is chosen at startup).
+8. On **Capture**: Connect camera → Start live. The preview is a downscaled live image (full-resolution Axiocam frames are about 20–40 MB and are still used for saved PNGs). Double-click the preview (or Fullscreen live) for a zoomable viewer (scroll wheel / Zoom ± / Esc).
+9. Sampling stills use the **latest live frame** encoded as PNG (no CZI dependency in this version).
+10. If live fails with a busy / conflict error, stop Live in the ZEN UI so the Gateway can start live from this app.
 
 Offline: leave **Use ZEN simulator** on — Capture shows a synthetic gray live stream for UI testing without Gateway.
 

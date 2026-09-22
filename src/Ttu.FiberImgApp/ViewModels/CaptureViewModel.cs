@@ -28,8 +28,8 @@ public partial class CaptureViewModel : ObservableObject
     private readonly DispatcherQueueTimer _positionTimer;
     private CancellationTokenSource? _runCts;
     private WriteableBitmap? _liveBitmap;
-    private DateTime _lastUiFrameUtc = DateTime.MinValue;
     private FullscreenImageWindow? _liveFullscreen;
+    private int _previewBusy;
     private bool _subscribed;
     private int _positionPollInFlight;
 
@@ -533,41 +533,60 @@ public partial class CaptureViewModel : ObservableObject
 
     private void OnFrameReceived(object? sender, CameraFrameEventArgs e)
     {
-        var now = DateTime.UtcNow;
-        if ((now - _lastUiFrameUtc).TotalMilliseconds < 70)
+        if (Interlocked.Exchange(ref _previewBusy, 1) == 1)
             return;
-        _lastUiFrameUtc = now;
 
         var frame = e.Frame;
-        _dispatcher.TryEnqueue(() =>
+        _ = Task.Run(() =>
         {
+            MonoFrameEncoder.PreviewBitmap preview;
             try
             {
-                UpdateLiveBitmap(frame);
-                ShowPlaceholderOverlay = false;
-                IsLive = true;
-                CameraStatus = _camera.Status;
-                _liveFullscreen?.SetImageSource(PreviewImage);
+                preview = MonoFrameEncoder.ToPreviewBgra32(frame);
             }
             catch (Exception ex)
             {
-                BannerMessage = $"Live frame error: {ex.Message}";
+                Interlocked.Exchange(ref _previewBusy, 0);
+                _dispatcher.TryEnqueue(() => BannerMessage = $"Live frame error: {ex.Message}");
+                return;
             }
+
+            var queued = _dispatcher.TryEnqueue(() =>
+            {
+                try
+                {
+                    UpdateLiveBitmap(preview.Bgra, preview.Width, preview.Height);
+                    ShowPlaceholderOverlay = false;
+                    IsLive = true;
+                    CameraStatus = _camera.Status;
+                    _liveFullscreen?.SetImageSource(PreviewImage);
+                }
+                catch (Exception ex)
+                {
+                    BannerMessage = $"Live frame error: {ex.Message}";
+                }
+                finally
+                {
+                    Interlocked.Exchange(ref _previewBusy, 0);
+                }
+            });
+
+            if (!queued)
+                Interlocked.Exchange(ref _previewBusy, 0);
         });
     }
 
-    private void UpdateLiveBitmap(CameraFrame frame)
+    private void UpdateLiveBitmap(byte[] bgra, int width, int height)
     {
-        var bgra = MonoFrameEncoder.ToBgra32(frame);
-        if (_liveBitmap is null || _liveBitmap.PixelWidth != frame.Width || _liveBitmap.PixelHeight != frame.Height)
+        if (_liveBitmap is null || _liveBitmap.PixelWidth != width || _liveBitmap.PixelHeight != height)
         {
-            _liveBitmap = new WriteableBitmap(frame.Width, frame.Height);
+            _liveBitmap = new WriteableBitmap(width, height);
             PreviewImage = _liveBitmap;
         }
 
         using (var stream = _liveBitmap.PixelBuffer.AsStream())
         {
-            stream.Write(bgra, 0, bgra.Length);
+            stream.Write(bgra, 0, Math.Min(bgra.Length, (int)stream.Length));
         }
 
         _liveBitmap.Invalidate();

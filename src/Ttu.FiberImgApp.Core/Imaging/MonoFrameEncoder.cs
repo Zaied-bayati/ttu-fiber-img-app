@@ -53,6 +53,36 @@ public static class MonoFrameEncoder
     public static byte[] ToBgra32(CameraFrame frame)
     {
         var gray = ToGray8(frame);
+        return Gray8ToBgra32(gray);
+    }
+
+    /// <summary>
+    /// Downsamples a frame for on-screen preview. Full-resolution Axiocam frames are tens of megabytes;
+    /// expanding those to BGRA on the UI thread stalls the live view.
+    /// </summary>
+    public static PreviewBitmap ToPreviewBgra32(CameraFrame frame, int maxEdge = 1600)
+    {
+        if (frame.Width <= 0 || frame.Height <= 0)
+            throw new ArgumentOutOfRangeException(nameof(frame), "Frame width and height must be positive.");
+        if (frame.RawPixels.Length == 0)
+            throw new InvalidOperationException("Frame has no pixel bytes.");
+
+        var step = 1;
+        var longEdge = Math.Max(frame.Width, frame.Height);
+        if (maxEdge > 0 && longEdge > maxEdge)
+            step = (int)Math.Ceiling(longEdge / (double)maxEdge);
+
+        var width = Math.Max(1, frame.Width / step);
+        var height = Math.Max(1, frame.Height / step);
+        var gray = new byte[width * height];
+        FillPreviewGray(frame, gray, width, height, step);
+        return new PreviewBitmap(Gray8ToBgra32(gray), width, height);
+    }
+
+    public readonly record struct PreviewBitmap(byte[] Bgra, int Width, int Height);
+
+    private static byte[] Gray8ToBgra32(byte[] gray)
+    {
         var bgra = new byte[gray.Length * 4];
         for (var i = 0; i < gray.Length; i++)
         {
@@ -63,7 +93,100 @@ public static class MonoFrameEncoder
             bgra[o + 2] = v;
             bgra[o + 3] = 255;
         }
+
         return bgra;
+    }
+
+    private static void FillPreviewGray(CameraFrame frame, byte[] gray, int width, int height, int step)
+    {
+        switch (frame.PixelFormat)
+        {
+            case CameraPixelFormat.Gray16:
+                FillPreviewGray16(frame, gray, width, height, step);
+                return;
+            case CameraPixelFormat.Gray8:
+            case CameraPixelFormat.Bgr24:
+            case CameraPixelFormat.Bgr48:
+                break;
+            default:
+                throw new NotSupportedException($"Pixel format {frame.PixelFormat} is not supported.");
+        }
+
+        for (var y = 0; y < height; y++)
+        {
+            var sy = y * step;
+            for (var x = 0; x < width; x++)
+            {
+                var sx = x * step;
+                gray[(y * width) + x] = SampleLuma8(frame, sx, sy);
+            }
+        }
+    }
+
+    private static void FillPreviewGray16(CameraFrame frame, byte[] gray, int width, int height, int step)
+    {
+        ushort min = ushort.MaxValue;
+        ushort max = ushort.MinValue;
+        var samples = new ushort[width * height];
+        for (var y = 0; y < height; y++)
+        {
+            var sy = y * step;
+            for (var x = 0; x < width; x++)
+            {
+                var sx = x * step;
+                var v = ReadGray16(frame, sx, sy);
+                samples[(y * width) + x] = v;
+                if (v < min) min = v;
+                if (v > max) max = v;
+            }
+        }
+
+        if (max <= min)
+        {
+            Array.Fill(gray, (byte)(min >> 8));
+            return;
+        }
+
+        var range = max - min;
+        for (var i = 0; i < samples.Length; i++)
+            gray[i] = (byte)(((samples[i] - min) * 255) / range);
+    }
+
+    private static byte SampleLuma8(CameraFrame frame, int x, int y)
+    {
+        var pixels = frame.RawPixels;
+        switch (frame.PixelFormat)
+        {
+            case CameraPixelFormat.Gray8:
+            {
+                var i = (y * frame.Width) + x;
+                return i >= 0 && i < pixels.Length ? pixels[i] : (byte)0;
+            }
+            case CameraPixelFormat.Bgr24:
+            {
+                var o = ((y * frame.Width) + x) * 3;
+                if (o < 0 || o + 2 >= pixels.Length) return 0;
+                return (byte)((pixels[o + 2] * 77 + pixels[o + 1] * 150 + pixels[o] * 29) >> 8);
+            }
+            case CameraPixelFormat.Bgr48:
+            {
+                var o = ((y * frame.Width) + x) * 6;
+                if (o < 0 || o + 5 >= pixels.Length) return 0;
+                var b = BinaryPrimitives.ReadUInt16LittleEndian(pixels.AsSpan(o));
+                var g = BinaryPrimitives.ReadUInt16LittleEndian(pixels.AsSpan(o + 2));
+                var r = BinaryPrimitives.ReadUInt16LittleEndian(pixels.AsSpan(o + 4));
+                return (byte)(((r * 77 + g * 150 + b * 29) >> 8) >> 8);
+            }
+            default:
+                return 0;
+        }
+    }
+
+    private static ushort ReadGray16(CameraFrame frame, int x, int y)
+    {
+        var o = ((y * frame.Width) + x) * 2;
+        if (o < 0 || o + 1 >= frame.RawPixels.Length) return 0;
+        return BinaryPrimitives.ReadUInt16LittleEndian(frame.RawPixels.AsSpan(o));
     }
 
     public static byte[] ToPng(CameraFrame frame)

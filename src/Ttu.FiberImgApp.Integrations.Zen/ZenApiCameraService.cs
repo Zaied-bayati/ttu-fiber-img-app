@@ -1,4 +1,5 @@
-using Google.Protobuf.WellKnownTypes;
+using System.Net.Http;
+using System.Net.Sockets;
 using Grpc.Core;
 using Grpc.Net.Client;
 using Microsoft.Extensions.Logging;
@@ -12,7 +13,9 @@ using ZenApi.Acquisition.V1Beta;
 namespace Ttu.FiberImgApp.Integrations.Zen;
 
 /// <summary>
-/// Axiocam / ZEN live + still capture via ZEN API Gateway (gRPC).
+/// Axiocam / ZEN live + still capture via the ZEN API Gateway (gRPC over TLS).
+/// Live pixels are possible: ZEN acquires the camera and ExperimentStreamingService
+/// pushes FrameData. This app does not talk to the Axiocam over USB.
 /// Stills are encoded from the latest streamed frame (PNG).
 /// </summary>
 public sealed class ZenApiCameraService : ICameraService, IZenClient, IAsyncDisposable
@@ -21,6 +24,7 @@ public sealed class ZenApiCameraService : ICameraService, IZenClient, IAsyncDisp
     private readonly ILogger<ZenApiCameraService> _logger;
     private readonly IActivityLog _activityLog;
     private readonly object _gate = new();
+    private readonly LiveFrameAssembler _assembler = new();
 
     private GrpcChannel? _channel;
     private ExperimentService.ExperimentServiceClient? _experiment;
@@ -28,11 +32,13 @@ public sealed class ZenApiCameraService : ICameraService, IZenClient, IAsyncDisp
     private Metadata? _metadata;
     private string? _experimentId;
     private CancellationTokenSource? _liveCts;
+    private CancellationTokenSource? _streamCts;
     private Task? _liveLoop;
     private CameraFrame? _lastFrame;
     private string _status = "ZEN camera - disconnected";
     private bool _connected;
     private bool _live;
+    private volatile bool _frameTooLarge;
 
     public ZenApiCameraService(IOptions<ZenOptions> options, ILogger<ZenApiCameraService> logger, IActivityLog activityLog)
     {
@@ -55,7 +61,7 @@ public sealed class ZenApiCameraService : ICameraService, IZenClient, IAsyncDisp
             var token = ZenChannelFactory.ResolveToken(_options);
             if (string.IsNullOrWhiteSpace(token))
             {
-                SetStatus("ZEN: missing ApiToken / ApiTokenFilePath");
+                SetStatus("ZEN: missing control token. Paste it in Settings, or leave the token blank to use C:\\ProgramData\\Carl Zeiss\\ZEN APIGateway\\GlobalControlToken.txt.");
                 return false;
             }
 
@@ -65,30 +71,62 @@ public sealed class ZenApiCameraService : ICameraService, IZenClient, IAsyncDisp
                 return false;
             }
 
+            await StopLiveAsync(cancellationToken).ConfigureAwait(false);
             await DisposeChannelAsync().ConfigureAwait(false);
 
-            _channel = ZenChannelFactory.Create(_options);
-            _metadata = new Metadata { { "control-token", token } };
-            _experiment = new ExperimentService.ExperimentServiceClient(_channel);
-            _streaming = new ExperimentStreamingService.ExperimentStreamingServiceClient(_channel);
-
-            var load = await _experiment.LoadAsync(
-                new ExperimentServiceLoadRequest { ExperimentName = _options.ExperimentName },
-                headers: _metadata,
-                cancellationToken: cancellationToken).ResponseAsync.ConfigureAwait(false);
-
-            lock (_gate)
+            Exception? lastTransport = null;
+            foreach (var port in ZenChannelFactory.CandidatePorts(_options.Port))
             {
-                _experimentId = load.ExperimentId;
-                _connected = true;
+                cancellationToken.ThrowIfCancellationRequested();
+                try
+                {
+                    await DisposeChannelAsync().ConfigureAwait(false);
+                    _channel = ZenChannelFactory.Create(_options, port, out var transportNote);
+                    _metadata = new Metadata { { "control-token", token } };
+                    _experiment = new ExperimentService.ExperimentServiceClient(_channel);
+                    _streaming = new ExperimentStreamingService.ExperimentStreamingServiceClient(_channel);
+
+                    var load = await _experiment.LoadAsync(
+                        new ExperimentServiceLoadRequest { ExperimentName = _options.ExperimentName },
+                        headers: _metadata,
+                        deadline: DateTime.UtcNow.AddSeconds(8),
+                        cancellationToken: cancellationToken).ResponseAsync.ConfigureAwait(false);
+
+                    lock (_gate)
+                    {
+                        _experimentId = load.ExperimentId;
+                        _connected = true;
+                    }
+
+                    await TryStopExperimentAsync(_experiment, _metadata, load.ExperimentId, cancellationToken)
+                        .ConfigureAwait(false);
+
+                    var portNote = port == _options.Port
+                        ? $"port {port}"
+                        : $"port {port} (saved port {_options.Port} did not answer)";
+                    SetStatus($"ZEN connected - experiment '{_options.ExperimentName}' ({_options.Host}, {portNote}, {transportNote})");
+                    return true;
+                }
+                catch (Exception ex) when (IsTransportFailure(ex))
+                {
+                    lastTransport = ex;
+                    _logger.LogWarning(ex, "ZEN gateway {Host}:{Port} did not answer", _options.Host, port);
+                    await DisposeChannelAsync().ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "ZEN Connect failed after the gateway answered");
+                    SetStatus($"ZEN connect failed: {ex.Message}");
+                    await DisposeChannelAsync().ConfigureAwait(false);
+                    return false;
+                }
             }
 
-            // Ensure we don't inherit a Live session left running from a previous attempt.
-            await TryStopExperimentAsync(_experiment, _metadata, load.ExperimentId, cancellationToken)
-                .ConfigureAwait(false);
-
-            SetStatus($"ZEN connected - experiment '{_options.ExperimentName}' (gateway {_options.Host}:{_options.Port})");
-            return true;
+            var detail = lastTransport?.Message ?? "no gateway response";
+            SetStatus(
+                $"ZEN connect failed: gateway not reachable ({detail}). " +
+                "Confirm ZEN API Gateway is running and the tray icon port matches Settings (default 5002).");
+            return false;
         }
         catch (Exception ex)
         {
@@ -127,165 +165,77 @@ public sealed class ZenApiCameraService : ICameraService, IZenClient, IAsyncDisp
             experiment = _experiment;
             streaming = _streaming;
             metadata = _metadata;
+            _frameTooLarge = false;
         }
 
-        // Clear a leftover Live/Continuous from a prior Start live (causes "same ID is already active").
         await TryStopExperimentAsync(experiment, metadata, experimentId, cancellationToken).ConfigureAwait(false);
 
         var cts = new CancellationTokenSource();
-        var streamReady = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var firstFrame = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         lock (_gate)
         {
             _liveCts = cts;
             _live = true;
-            _liveLoop = Task.Run(
-                () => StreamLoopAsync(streaming, metadata, experimentId, streamReady, firstFrame, cts.Token),
-                cts.Token);
+            _assembler.Reset();
         }
 
+        // The pixel stream must stay tied to _liveCts. Disposing a linked token when StartLiveAsync
+        // returns would cancel the stream as soon as the first frame arrived.
         try
         {
-            try
-            {
-                await streamReady.Task.WaitAsync(TimeSpan.FromSeconds(5), cancellationToken).ConfigureAwait(false);
-            }
-            catch (TimeoutException)
-            {
-                SetStatus("ZEN: timed out opening pixel monitor stream");
-            }
-
-            await StartAcquisitionAsync(experiment, metadata, experimentId, live: true, cancellationToken)
+            var controlling = await TryStartAcquisitionAsync(experiment, metadata, experimentId, live: true, cancellationToken)
                 .ConfigureAwait(false);
-            SetStatus("ZEN live started — waiting for frames...");
 
-            if (await WaitForFirstFrameAsync(firstFrame, TimeSpan.FromSeconds(6), cancellationToken).ConfigureAwait(false))
+            if (await WatchForFramesAsync(streaming, metadata, experimentId, cts.Token, cancellationToken).ConfigureAwait(false))
             {
-                SetStatus("ZEN live running");
+                SetStatus(controlling ? "ZEN live running" : "ZEN live running (stream from ZEN UI)");
                 return;
             }
 
-            // StartLive left the experiment active — must Stop before Continuous.
-            SetStatus("ZEN StartLive: no frames — stopping, then StartContinuous...");
-            await TryStopExperimentAsync(experiment, metadata, experimentId, cancellationToken).ConfigureAwait(false);
+            if (_frameTooLarge)
+                throw new InvalidOperationException(Status);
 
-            await StartAcquisitionAsync(experiment, metadata, experimentId, live: false, cancellationToken)
-                .ConfigureAwait(false);
-            SetStatus("ZEN continuous started — waiting for frames...");
-
-            if (await WaitForFirstFrameAsync(firstFrame, TimeSpan.FromSeconds(8), cancellationToken).ConfigureAwait(false))
+            if (controlling)
             {
-                SetStatus("ZEN live running (continuous)");
-                return;
+                SetStatus("ZEN StartLive produced no frames — stopping, then StartContinuous...");
+                await TryStopExperimentAsync(experiment, metadata, experimentId, cancellationToken).ConfigureAwait(false);
+                _assembler.Reset();
+                await TryStartAcquisitionAsync(experiment, metadata, experimentId, live: false, cancellationToken)
+                    .ConfigureAwait(false);
+
+                if (await WatchForFramesAsync(streaming, metadata, experimentId, cts.Token, cancellationToken).ConfigureAwait(false))
+                {
+                    SetStatus("ZEN live running (continuous)");
+                    return;
+                }
             }
 
-            SetStatus(
+            if (_frameTooLarge)
+                throw new InvalidOperationException(Status);
+
+            const string noFrames =
                 "ZEN acquisition started but no pixel frames arrived. " +
-                "Confirm Fiber Img App Gateway port matches the Gateway UI (often 50051 or 5002), " +
-                "stop Live in ZEN, enable API mode if available, then retry.");
+                "Enable Unsupervised API Mode in ZEN (Tools → Options → ZEN API), stop Live in the ZEN window, " +
+                "and confirm the experiment uses the Axiocam. Then start live again.";
+            await StopLiveAsync(CancellationToken.None).ConfigureAwait(false);
+            SetStatus(noFrames);
         }
-        catch
+        catch (OperationCanceledException)
         {
             await StopLiveAsync(CancellationToken.None).ConfigureAwait(false);
             throw;
         }
-    }
-
-    private static async Task<bool> WaitForFirstFrameAsync(
-        TaskCompletionSource firstFrame,
-        TimeSpan timeout,
-        CancellationToken cancellationToken)
-    {
-        try
-        {
-            await firstFrame.Task.WaitAsync(timeout, cancellationToken).ConfigureAwait(false);
-            return true;
-        }
-        catch (TimeoutException)
-        {
-            return false;
-        }
-    }
-
-    private async Task StartAcquisitionAsync(
-        ExperimentService.ExperimentServiceClient experiment,
-        Metadata metadata,
-        string experimentId,
-        bool live,
-        CancellationToken cancellationToken)
-    {
-        try
-        {
-            if (live)
-            {
-                await experiment.StartLiveAsync(
-                    new ExperimentServiceStartLiveRequest
-                    {
-                        ExperimentId = experimentId,
-                        TrackIndex = 0,
-                    },
-                    headers: metadata,
-                    cancellationToken: cancellationToken).ResponseAsync.ConfigureAwait(false);
-            }
-            else
-            {
-                await experiment.StartContinuousAsync(
-                    new ExperimentServiceStartContinuousRequest { ExperimentId = experimentId },
-                    headers: metadata,
-                    cancellationToken: cancellationToken).ResponseAsync.ConfigureAwait(false);
-            }
-        }
-        catch (RpcException ex) when (IsAlreadyActive(ex))
-        {
-            SetStatus("ZEN: experiment already active — stopping and retrying...");
-            await TryStopExperimentAsync(experiment, metadata, experimentId, cancellationToken).ConfigureAwait(false);
-            if (live)
-            {
-                await experiment.StartLiveAsync(
-                    new ExperimentServiceStartLiveRequest
-                    {
-                        ExperimentId = experimentId,
-                        TrackIndex = 0,
-                    },
-                    headers: metadata,
-                    cancellationToken: cancellationToken).ResponseAsync.ConfigureAwait(false);
-            }
-            else
-            {
-                await experiment.StartContinuousAsync(
-                    new ExperimentServiceStartContinuousRequest { ExperimentId = experimentId },
-                    headers: metadata,
-                    cancellationToken: cancellationToken).ResponseAsync.ConfigureAwait(false);
-            }
-        }
-    }
-
-    private static bool IsAlreadyActive(RpcException ex) =>
-        ex.Status.Detail.Contains("already active", StringComparison.OrdinalIgnoreCase)
-        || ex.Message.Contains("already active", StringComparison.OrdinalIgnoreCase);
-
-    private async Task TryStopExperimentAsync(
-        ExperimentService.ExperimentServiceClient experiment,
-        Metadata metadata,
-        string experimentId,
-        CancellationToken cancellationToken)
-    {
-        try
-        {
-            await experiment.StopAsync(
-                new ExperimentServiceStopRequest { ExperimentId = experimentId },
-                headers: metadata,
-                cancellationToken: cancellationToken).ResponseAsync.ConfigureAwait(false);
-        }
         catch (Exception ex)
         {
-            _logger.LogDebug(ex, "ZEN Stop before start (ignored if nothing was running)");
+            await StopLiveAsync(CancellationToken.None).ConfigureAwait(false);
+            SetStatus($"ZEN live failed: {ex.Message}");
+            throw;
         }
     }
 
     public async Task StopLiveAsync(CancellationToken cancellationToken = default)
     {
         CancellationTokenSource? cts;
+        CancellationTokenSource? streamCts;
         Task? loop;
         string? experimentId;
         ExperimentService.ExperimentServiceClient? experiment;
@@ -294,22 +244,28 @@ public sealed class ZenApiCameraService : ICameraService, IZenClient, IAsyncDisp
         lock (_gate)
         {
             cts = _liveCts;
+            streamCts = _streamCts;
             loop = _liveLoop;
             experimentId = _experimentId;
             experiment = _experiment;
             metadata = _metadata;
             _liveCts = null;
+            _streamCts = null;
             _liveLoop = null;
             _live = false;
         }
 
-        if (cts is not null)
+        streamCts?.Cancel();
+        cts?.Cancel();
+        try { if (loop is not null) await loop.ConfigureAwait(false); }
+        catch (OperationCanceledException) { }
+        finally
         {
-            cts.Cancel();
-            try { if (loop is not null) await loop.ConfigureAwait(false); }
-            catch (OperationCanceledException) { }
-            finally { cts.Dispose(); }
+            streamCts?.Dispose();
+            cts?.Dispose();
         }
+
+        _assembler.Reset();
 
         if (experiment is not null && metadata is not null && !string.IsNullOrEmpty(experimentId))
         {
@@ -331,7 +287,6 @@ public sealed class ZenApiCameraService : ICameraService, IZenClient, IAsyncDisp
 
     public async Task<byte[]> CaptureStillAsync(CancellationToken cancellationToken = default)
     {
-        // Wait for a frame acquired after this call so sampling does not save a pre-move exposure.
         var frame = await WaitForFreshFrameAsync(cancellationToken).ConfigureAwait(false);
         return MonoFrameEncoder.ToPng(frame);
     }
@@ -386,227 +341,320 @@ public sealed class ZenApiCameraService : ICameraService, IZenClient, IAsyncDisp
             "Timed out waiting for a fresh ZEN frame after the stage move. Capture aborted to avoid stale data.");
     }
 
-    private async Task StreamLoopAsync(
+    private async Task<bool> TryStartAcquisitionAsync(
+        ExperimentService.ExperimentServiceClient experiment,
+        Metadata metadata,
+        string experimentId,
+        bool live,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            await StartAcquisitionOnceAsync(experiment, metadata, experimentId, live, cancellationToken)
+                .ConfigureAwait(false);
+            return true;
+        }
+        catch (RpcException ex) when (IsAlreadyActive(ex))
+        {
+            SetStatus("ZEN: experiment already active — stopping and retrying...");
+            await TryStopExperimentAsync(experiment, metadata, experimentId, cancellationToken).ConfigureAwait(false);
+            await StartAcquisitionOnceAsync(experiment, metadata, experimentId, live, cancellationToken)
+                .ConfigureAwait(false);
+            return true;
+        }
+        catch (RpcException ex) when (IsControllingDenied(ex))
+        {
+            _logger.LogWarning(ex, "ZEN controlling call denied");
+            SetStatus(
+                "ZEN API control is locked. Enable Unsupervised API Mode (ZEN: Tools → Options → ZEN API), " +
+                "or start Live in ZEN — this app will display that stream.");
+            return false;
+        }
+    }
+
+    private static Task StartAcquisitionOnceAsync(
+        ExperimentService.ExperimentServiceClient experiment,
+        Metadata metadata,
+        string experimentId,
+        bool live,
+        CancellationToken cancellationToken)
+    {
+        if (live)
+        {
+            return experiment.StartLiveAsync(
+                new ExperimentServiceStartLiveRequest
+                {
+                    ExperimentId = experimentId,
+                    TrackIndex = 0,
+                },
+                headers: metadata,
+                cancellationToken: cancellationToken).ResponseAsync;
+        }
+
+        return experiment.StartContinuousAsync(
+            new ExperimentServiceStartContinuousRequest { ExperimentId = experimentId },
+            headers: metadata,
+            cancellationToken: cancellationToken).ResponseAsync;
+    }
+
+    private async Task<bool> WatchForFramesAsync(
         ExperimentStreamingService.ExperimentStreamingServiceClient streaming,
         Metadata metadata,
         string experimentId,
-        TaskCompletionSource streamReady,
-        TaskCompletionSource firstFrame,
-        CancellationToken token)
+        CancellationToken liveToken,
+        CancellationToken cancellationToken)
     {
+        // Zeiss' own viewer subscribes after acquisition is running and asks for full frames
+        // (enable_raw_data = false). Scan-line mode is the fallback.
+        var attempts = new (bool AllExperiments, bool EnableRawData, string Label)[]
+        {
+            (false, false, "MonitorExperiment full frames"),
+            (false, true, "MonitorExperiment raw scan lines"),
+            (true, false, "MonitorAllExperiments full frames"),
+            (true, true, "MonitorAllExperiments raw scan lines"),
+        };
+
+        foreach (var attempt in attempts)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (_frameTooLarge)
+                return false;
+
+            SetStatus($"ZEN waiting for pixels ({attempt.Label})...");
+            var hit = await MonitorOnceAsync(
+                streaming,
+                metadata,
+                experimentId,
+                attempt.AllExperiments,
+                attempt.EnableRawData,
+                TimeSpan.FromSeconds(4),
+                liveToken,
+                cancellationToken).ConfigureAwait(false);
+
+            if (hit == MonitorHit.Frame)
+                return true;
+        }
+
+        return false;
+    }
+
+    private async Task<MonitorHit> MonitorOnceAsync(
+        ExperimentStreamingService.ExperimentStreamingServiceClient streaming,
+        Metadata metadata,
+        string experimentId,
+        bool allExperiments,
+        bool enableRawData,
+        TimeSpan timeout,
+        CancellationToken liveToken,
+        CancellationToken cancellationToken)
+    {
+        var attempt = CancellationTokenSource.CreateLinkedTokenSource(liveToken);
+        var first = new TaskCompletionSource<MonitorHit>(TaskCreationOptions.RunContinuationsAsynchronously);
+        _assembler.Reset();
+        var loop = Task.Run(
+            () => ConsumeAsync(streaming, metadata, experimentId, allExperiments, enableRawData, first, attempt.Token));
+
         try
         {
-            // Run both monitors: some ZEN builds only emit Live pixels on MonitorAllExperiments.
-            var experimentMonitor = ConsumeStreamAsync(
-                () =>
-                {
-                    var request = new ExperimentStreamingServiceMonitorExperimentRequest
-                    {
-                        ExperimentId = experimentId,
-                        EnableRawData = true,
-                    };
-                    // Omit ChannelIndex so ZEN returns all channels (Zeiss default).
-                    return streaming.MonitorExperiment(request, headers: metadata, cancellationToken: token);
-                },
-                "MonitorExperiment",
-                streamReady,
-                firstFrame,
-                token);
-
-            var allMonitor = ConsumeStreamAsync(
-                () =>
-                {
-                    var request = new ExperimentStreamingServiceMonitorAllExperimentsRequest
-                    {
-                        EnableRawData = true,
-                    };
-                    return streaming.MonitorAllExperiments(request, headers: metadata, cancellationToken: token);
-                },
-                "MonitorAllExperiments",
-                streamReady,
-                firstFrame,
-                token);
-
-            await Task.WhenAll(experimentMonitor, allMonitor).ConfigureAwait(false);
-
-            if (!firstFrame.Task.IsCompleted)
+            var hit = await first.Task.WaitAsync(timeout, cancellationToken).ConfigureAwait(false);
+            if (hit == MonitorHit.Frame)
             {
-                SetStatus("ZEN stream ended without any usable pixel frames");
-                firstFrame.TrySetException(new InvalidOperationException("ZEN stream ended without frames."));
+                lock (_gate)
+                {
+                    _streamCts = attempt;
+                    _liveLoop = loop;
+                }
+
+                return MonitorHit.Frame;
             }
+
+            await CancelAttemptAsync(attempt, loop).ConfigureAwait(false);
+            return hit;
+        }
+        catch (TimeoutException)
+        {
+            await CancelAttemptAsync(attempt, loop).ConfigureAwait(false);
+            return MonitorHit.None;
         }
         catch (OperationCanceledException)
         {
-            streamReady.TrySetCanceled(token);
-            firstFrame.TrySetCanceled(token);
+            await CancelAttemptAsync(attempt, loop).ConfigureAwait(false);
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "ZEN monitor failed");
+            await CancelAttemptAsync(attempt, loop).ConfigureAwait(false);
+            return MonitorHit.Failed;
+        }
+    }
+
+    private static async Task CancelAttemptAsync(CancellationTokenSource attempt, Task loop)
+    {
+        attempt.Cancel();
+        try { await loop.ConfigureAwait(false); }
+        catch (OperationCanceledException) { }
+        catch (Exception) { }
+        finally { attempt.Dispose(); }
+    }
+
+    private async Task ConsumeAsync(
+        ExperimentStreamingService.ExperimentStreamingServiceClient streaming,
+        Metadata metadata,
+        string experimentId,
+        bool allExperiments,
+        bool enableRawData,
+        TaskCompletionSource<MonitorHit> first,
+        CancellationToken token)
+    {
+        var sourceName = allExperiments ? "MonitorAllExperiments" : "MonitorExperiment";
+        try
+        {
+            using var call = allExperiments
+                ? streaming.MonitorAllExperiments(
+                    new ExperimentStreamingServiceMonitorAllExperimentsRequest { EnableRawData = enableRawData },
+                    headers: metadata,
+                    cancellationToken: token)
+                : null;
+
+            using var experimentCall = allExperiments
+                ? null
+                : streaming.MonitorExperiment(
+                    new ExperimentStreamingServiceMonitorExperimentRequest
+                    {
+                        ExperimentId = experimentId,
+                        EnableRawData = enableRawData,
+                    },
+                    headers: metadata,
+                    cancellationToken: token);
+
+            SetStatus($"ZEN {sourceName} stream open (raw data {enableRawData})");
+
+            if (allExperiments)
+            {
+                await foreach (var response in call!.ResponseStream.ReadAllAsync(token).ConfigureAwait(false))
+                    Publish(response.FrameData, sourceName, enableRawData, first);
+            }
+            else
+            {
+                await foreach (var response in experimentCall!.ResponseStream.ReadAllAsync(token).ConfigureAwait(false))
+                    Publish(response.FrameData, sourceName, enableRawData, first);
+            }
+
+            NoteKeptStreamEnded(first);
+        }
+        catch (OperationCanceledException)
+        {
+            first.TrySetCanceled(token);
         }
         catch (RpcException ex) when (ex.StatusCode == StatusCode.Cancelled)
         {
-            streamReady.TrySetCanceled();
-            firstFrame.TrySetCanceled();
+            first.TrySetCanceled();
         }
-        catch (Exception ex)
+        catch (RpcException ex) when (ex.StatusCode == StatusCode.ResourceExhausted)
         {
-            _logger.LogError(ex, "ZEN stream failed");
-            SetStatus($"ZEN stream error: {ex.Message}");
-            streamReady.TrySetException(ex);
-            firstFrame.TrySetException(ex);
-            lock (_gate) _live = false;
+            _frameTooLarge = true;
+            var message = "ZEN frame is larger than the gateway/client receive limit. Full Axiocam frames need a raised gRPC size (this app allows 256 MB).";
+            _logger.LogError(ex, message);
+            SetStatus(message);
+            first.TrySetException(ex);
         }
-    }
-
-    private async Task ConsumeStreamAsync<TResponse>(
-        Func<AsyncServerStreamingCall<TResponse>> startCall,
-        string sourceName,
-        TaskCompletionSource streamReady,
-        TaskCompletionSource firstFrame,
-        CancellationToken token)
-        where TResponse : class
-    {
-        var skippedEmpty = 0;
-        try
-        {
-            using var call = startCall();
-            streamReady.TrySetResult();
-            SetStatus($"ZEN {sourceName} stream open");
-
-            await foreach (var response in call.ResponseStream.ReadAllAsync(token).ConfigureAwait(false))
-            {
-                var frameData = ExtractFrameData(response);
-                var frame = ToCameraFrame(frameData, out var skipReason);
-                if (frame is null)
-                {
-                    skippedEmpty++;
-                    if (skippedEmpty is 1 or 10 or 50)
-                    {
-                        _logger.LogWarning(
-                            "ZEN {Source} skipped frame ({Count}): {Reason}",
-                            sourceName,
-                            skippedEmpty,
-                            skipReason);
-                        SetStatus($"ZEN {sourceName}: skipping frames ({skipReason})");
-                    }
-
-                    continue;
-                }
-
-                lock (_gate) _lastFrame = frame;
-                if (firstFrame.TrySetResult())
-                    SetStatus($"ZEN live frame from {sourceName} ({frame.Width}x{frame.Height} {frame.PixelFormat})");
-                FrameReceived?.Invoke(this, new CameraFrameEventArgs(frame));
-            }
-        }
-        catch (OperationCanceledException) { }
-        catch (RpcException ex) when (ex.StatusCode == StatusCode.Cancelled) { }
         catch (RpcException ex) when (ex.StatusCode == StatusCode.Unimplemented)
         {
-            _logger.LogWarning(ex, "ZEN {Source} unimplemented on this Gateway/ZEN build", sourceName);
-            SetStatus($"ZEN {sourceName} unimplemented on this ZEN build");
-            streamReady.TrySetResult(); // allow StartLive to proceed using the other monitor
+            _logger.LogWarning(ex, "ZEN {Source} is not implemented on this Gateway", sourceName);
+            SetStatus($"ZEN {sourceName} is not implemented on this ZEN build");
+            first.TrySetResult(MonitorHit.Failed);
         }
         catch (Exception ex)
         {
+            if (KeptStreamEnded(first))
+            {
+                _logger.LogWarning(ex, "ZEN {Source} ended", sourceName);
+                SetStatus($"ZEN pixel stream ended: {ex.Message}");
+                return;
+            }
+
             _logger.LogWarning(ex, "ZEN {Source} ended with error", sourceName);
             SetStatus($"ZEN {sourceName} error: {ex.Message}");
-            streamReady.TrySetResult();
+            first.TrySetException(ex);
         }
     }
 
-    private static FrameData? ExtractFrameData<TResponse>(TResponse response)
+    private void NoteKeptStreamEnded(TaskCompletionSource<MonitorHit> first)
     {
-        return response switch
-        {
-            ExperimentStreamingServiceMonitorExperimentResponse exp => exp.FrameData,
-            ExperimentStreamingServiceMonitorAllExperimentsResponse all => all.FrameData,
-            _ => null,
-        };
+        if (KeptStreamEnded(first))
+            SetStatus("ZEN pixel stream ended");
+        else
+            first.TrySetResult(MonitorHit.None);
     }
 
-    private static CameraFrame? ToCameraFrame(FrameData? data, out string skipReason)
+    private bool KeptStreamEnded(TaskCompletionSource<MonitorHit> first)
     {
-        skipReason = string.Empty;
-        if (data is null)
-        {
-            skipReason = "FrameData is null";
-            return null;
-        }
+        if (!first.Task.IsCompletedSuccessfully || first.Task.Result != MonitorHit.Frame)
+            return false;
 
-        if (data.PixelData is null)
-        {
-            skipReason = "PixelData is null";
-            return null;
-        }
-
-        var pixels = data.PixelData.RawData.ToByteArray();
-        if (pixels.Length == 0)
-        {
-            skipReason = "RawData is empty (try EnableRawData / check experiment is acquiring)";
-            return null;
-        }
-
-        var format = data.PixelData.PixelType switch
-        {
-            PixelType.Gray8 => CameraPixelFormat.Gray8,
-            PixelType.Gray16 => CameraPixelFormat.Gray16,
-            PixelType.Bgr24 => CameraPixelFormat.Bgr24,
-            PixelType.Bgr48 => CameraPixelFormat.Bgr48,
-            PixelType.Unspecified => InferFormatFromByteLength(pixels.Length, data),
-            _ => InferFormatFromByteLength(pixels.Length, data),
-        };
-
-        var width = data.PixelData.Size?.Width > 0
-            ? data.PixelData.Size.Width
-            : data.FrameSize?.Width ?? 0;
-        var height = data.PixelData.Size?.Height > 0
-            ? data.PixelData.Size.Height
-            : data.FrameSize?.Height ?? 0;
-        if (width <= 0 || height <= 0)
-        {
-            skipReason = "Width/Height missing on frame";
-            return null;
-        }
-
-        var expected = ExpectedByteLength(format, width, height);
-        if (expected > 0 && pixels.Length < expected)
-        {
-            skipReason = $"Got {pixels.Length} bytes, expected >= {expected} for {width}x{height} {format}";
-            return null;
-        }
-
-        return new CameraFrame
-        {
-            RawPixels = pixels,
-            Width = width,
-            Height = height,
-            PixelFormat = format,
-            CapturedAt = DateTimeOffset.UtcNow,
-        };
+        lock (_gate) _live = false;
+        return true;
     }
 
-    private static CameraPixelFormat InferFormatFromByteLength(int byteLength, FrameData data)
+    private void Publish(FrameData? data, string sourceName, bool enableRawData, TaskCompletionSource<MonitorHit> first)
     {
-        var width = data.PixelData?.Size?.Width > 0 ? data.PixelData.Size.Width : data.FrameSize?.Width ?? 0;
-        var height = data.PixelData?.Size?.Height > 0 ? data.PixelData.Size.Height : data.FrameSize?.Height ?? 0;
-        if (width <= 0 || height <= 0) return CameraPixelFormat.Gray8;
+        var frame = _assembler.Add(data, out var skipReason);
+        if (frame is null)
+        {
+            if (!enableRawData && skipReason.Contains("RawData is empty", StringComparison.Ordinal))
+                first.TrySetResult(MonitorHit.NeedRawData);
+            else if (!string.IsNullOrEmpty(skipReason) && !skipReason.StartsWith("buffering", StringComparison.Ordinal))
+                _logger.LogDebug("ZEN {Source} skipped frame: {Reason}", sourceName, skipReason);
+            return;
+        }
 
-        var pixels = width * height;
-        if (byteLength >= pixels * 6) return CameraPixelFormat.Bgr48;
-        if (byteLength >= pixels * 3) return CameraPixelFormat.Bgr24;
-        if (byteLength >= pixels * 2) return CameraPixelFormat.Gray16;
-        return CameraPixelFormat.Gray8;
+        lock (_gate) _lastFrame = frame;
+        if (first.TrySetResult(MonitorHit.Frame))
+            SetStatus($"ZEN live frame from {sourceName} ({frame.Width}x{frame.Height} {frame.PixelFormat})");
+        FrameReceived?.Invoke(this, new CameraFrameEventArgs(frame));
     }
 
-    private static int ExpectedByteLength(CameraPixelFormat format, int width, int height)
+    private async Task TryStopExperimentAsync(
+        ExperimentService.ExperimentServiceClient experiment,
+        Metadata metadata,
+        string experimentId,
+        CancellationToken cancellationToken)
     {
-        var pixels = checked(width * height);
-        return format switch
+        try
         {
-            CameraPixelFormat.Gray8 => pixels,
-            CameraPixelFormat.Gray16 => pixels * 2,
-            CameraPixelFormat.Bgr24 => pixels * 3,
-            CameraPixelFormat.Bgr48 => pixels * 6,
-            _ => 0,
-        };
+            await experiment.StopAsync(
+                new ExperimentServiceStopRequest { ExperimentId = experimentId },
+                headers: metadata,
+                cancellationToken: cancellationToken).ResponseAsync.ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "ZEN Stop before start (ignored if nothing was running)");
+        }
+    }
+
+    private static bool IsAlreadyActive(RpcException ex) =>
+        ex.Status.Detail.Contains("already active", StringComparison.OrdinalIgnoreCase)
+        || ex.Message.Contains("already active", StringComparison.OrdinalIgnoreCase);
+
+    private static bool IsControllingDenied(RpcException ex) =>
+        ex.StatusCode == StatusCode.PermissionDenied
+        || ex.Status.Detail.Contains("not allowed", StringComparison.OrdinalIgnoreCase)
+        || ex.Status.Detail.Contains("API mode", StringComparison.OrdinalIgnoreCase)
+        || ex.Status.Detail.Contains("unsupervised", StringComparison.OrdinalIgnoreCase);
+
+    private static bool IsTransportFailure(Exception ex)
+    {
+        for (var current = ex; current is not null; current = current.InnerException)
+        {
+            if (current is HttpRequestException or SocketException or System.Security.Authentication.AuthenticationException)
+                return true;
+            if (current is RpcException rpc && rpc.StatusCode is StatusCode.Unavailable or StatusCode.DeadlineExceeded)
+                return true;
+        }
+
+        return false;
     }
 
     private void SetStatus(string status)
@@ -629,5 +677,181 @@ public sealed class ZenApiCameraService : ICameraService, IZenClient, IAsyncDisp
     public async ValueTask DisposeAsync()
     {
         await DisconnectAsync().ConfigureAwait(false);
+    }
+
+    private enum MonitorHit
+    {
+        None = 0,
+        Frame = 1,
+        NeedRawData = 2,
+        Failed = 3,
+    }
+
+    /// <summary>
+    /// Stitches Gateway tiles / scan lines into one image. A full-frame packet is returned as-is.
+    /// </summary>
+    private sealed class LiveFrameAssembler
+    {
+        private byte[] _pixels = [];
+        private int _width;
+        private int _height;
+        private CameraPixelFormat _format;
+        private int _bpp;
+        private long _lastEmitTick;
+
+        public void Reset()
+        {
+            _pixels = [];
+            _width = 0;
+            _height = 0;
+            _bpp = 0;
+            _lastEmitTick = 0;
+        }
+
+        public CameraFrame? Add(FrameData? data, out string skipReason)
+        {
+            skipReason = string.Empty;
+            if (data?.PixelData is null)
+            {
+                skipReason = "PixelData is null";
+                return null;
+            }
+
+            var raw = data.PixelData.RawData.ToByteArray();
+            if (raw.Length == 0)
+            {
+                skipReason = "RawData is empty";
+                return null;
+            }
+
+            var format = data.PixelData.PixelType switch
+            {
+                PixelType.Gray8 => CameraPixelFormat.Gray8,
+                PixelType.Gray16 => CameraPixelFormat.Gray16,
+                PixelType.Bgr24 => CameraPixelFormat.Bgr24,
+                PixelType.Bgr48 => CameraPixelFormat.Bgr48,
+                _ => InferFormat(raw.Length, data),
+            };
+            var bpp = BytesPerPixel(format);
+            if (bpp <= 0)
+            {
+                skipReason = $"Unsupported pixel type {data.PixelData.PixelType}";
+                return null;
+            }
+
+            var tileW = data.PixelData.Size?.Width ?? 0;
+            var tileH = data.PixelData.Size?.Height ?? 0;
+            var fullW = data.FrameSize?.Width ?? 0;
+            var fullH = data.FrameSize?.Height ?? 0;
+            if (tileW <= 0) tileW = fullW;
+            if (tileH <= 0) tileH = fullH;
+            if (fullW <= 0) fullW = tileW;
+            if (fullH <= 0) fullH = tileH;
+            if (tileW <= 0 || tileH <= 0 || fullW <= 0 || fullH <= 0)
+            {
+                skipReason = "Width/Height missing on frame";
+                return null;
+            }
+
+            var expected = checked(tileW * tileH * bpp);
+            if (raw.Length < expected)
+            {
+                skipReason = $"Got {raw.Length} bytes, expected >= {expected} for {tileW}x{tileH} {format}";
+                return null;
+            }
+
+            var startX = data.PixelData.StartPosition?.X ?? 0;
+            var startY = data.PixelData.StartPosition?.Y ?? 0;
+            if (data.PixelData.StartPosition is null && (tileW < fullW || tileH < fullH))
+            {
+                startX = data.FramePosition?.X ?? 0;
+                startY = data.FramePosition?.Y ?? 0;
+            }
+
+            if (startX == 0 && startY == 0 && tileW == fullW && tileH == fullH)
+            {
+                Reset();
+                return new CameraFrame
+                {
+                    RawPixels = raw,
+                    Width = fullW,
+                    Height = fullH,
+                    PixelFormat = format,
+                    CapturedAt = DateTimeOffset.UtcNow,
+                };
+            }
+
+            EnsureCanvas(fullW, fullH, format, bpp);
+            Blit(raw, startX, startY, tileW, tileH);
+
+            var now = Environment.TickCount64;
+            var completed = startY + tileH >= _height && startX + tileW >= _width;
+            if (!completed && now - _lastEmitTick < 120)
+            {
+                skipReason = "buffering scan lines";
+                return null;
+            }
+
+            _lastEmitTick = now;
+            return new CameraFrame
+            {
+                RawPixels = (byte[])_pixels.Clone(),
+                Width = _width,
+                Height = _height,
+                PixelFormat = _format,
+                CapturedAt = DateTimeOffset.UtcNow,
+            };
+        }
+
+        private void EnsureCanvas(int width, int height, CameraPixelFormat format, int bpp)
+        {
+            if (_width == width && _height == height && _format == format && _pixels.Length == width * height * bpp)
+                return;
+
+            _width = width;
+            _height = height;
+            _format = format;
+            _bpp = bpp;
+            _pixels = new byte[checked(width * height * bpp)];
+            _lastEmitTick = 0;
+        }
+
+        private void Blit(byte[] src, int startX, int startY, int tileW, int tileH)
+        {
+            var srcStride = tileW * _bpp;
+            var dstStride = _width * _bpp;
+            for (var row = 0; row < tileH; row++)
+            {
+                var dy = startY + row;
+                if (dy < 0 || dy >= _height) continue;
+                var dx = Math.Max(0, startX);
+                var srcOffset = (row * srcStride) + ((dx - startX) * _bpp);
+                var copy = Math.Min(srcStride - ((dx - startX) * _bpp), (_width - dx) * _bpp);
+                if (copy <= 0 || srcOffset < 0 || srcOffset + copy > src.Length) continue;
+                Buffer.BlockCopy(src, srcOffset, _pixels, (dy * dstStride) + (dx * _bpp), copy);
+            }
+        }
+
+        private static CameraPixelFormat InferFormat(int byteLength, FrameData data)
+        {
+            var width = data.PixelData?.Size?.Width > 0 ? data.PixelData.Size.Width : data.FrameSize?.Width ?? 0;
+            var height = data.PixelData?.Size?.Height > 0 ? data.PixelData.Size.Height : data.FrameSize?.Height ?? 0;
+            if (width <= 0 || height <= 0) return CameraPixelFormat.Gray8;
+
+            var pixels = width * height;
+            if (byteLength >= pixels * 6) return CameraPixelFormat.Bgr48;
+            if (byteLength >= pixels * 3) return CameraPixelFormat.Bgr24;
+            if (byteLength >= pixels * 2) return CameraPixelFormat.Gray16;
+            return CameraPixelFormat.Gray8;
+        }
+
+        private static int BytesPerPixel(CameraPixelFormat format) => format switch
+        {
+            CameraPixelFormat.Gray8 => 1,
+            CameraPixelFormat.Gray16 => 2,
+            CameraPixelFormat.Bgr24 => 3,
+            CameraPixelFormat.Bgr48 => 6,
+            _ => 0,
+        };
     }
 }

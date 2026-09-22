@@ -89,7 +89,7 @@ public partial class SettingsViewModel : ObservableObject
     public partial string ZenHost { get; set; } = "localhost";
 
     [ObservableProperty]
-    public partial double ZenPort { get; set; } = 50051;
+    public partial double ZenPort { get; set; } = 5002;
 
     [ObservableProperty]
     public partial string ZenExperimentName { get; set; } = string.Empty;
