@@ -17,6 +17,10 @@ message ExperimentServiceStartLiveRequest {
   google.protobuf.Int32Value track_index = 2;
 }
 
+message ExperimentServiceStartContinuousRequest {
+  string experiment_id = 1;
+}
+
 message ExperimentServiceStopRequest {
   string experiment_id = 1;
 }
@@ -28,5 +32,6 @@ message ExperimentServiceStopResponse {
 service ExperimentService {
   rpc Load(ExperimentServiceLoadRequest) returns (ExperimentServiceLoadResponse);
   rpc StartLive(ExperimentServiceStartLiveRequest) returns (google.protobuf.Empty);
+  rpc StartContinuous(ExperimentServiceStartContinuousRequest) returns (google.protobuf.Empty);
   rpc Stop(ExperimentServiceStopRequest) returns (ExperimentServiceStopResponse);
 }

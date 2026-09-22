@@ -149,8 +149,13 @@ public sealed class ZenApiCameraService : ICameraService, IZenClient, IAsyncDisp
                 SetStatus("ZEN: timed out opening MonitorExperiment stream");
             }
 
+            // Zeiss examples always pass track_index=0 for StartLive (mono / first track).
             await experiment.StartLiveAsync(
-                new ExperimentServiceStartLiveRequest { ExperimentId = experimentId },
+                new ExperimentServiceStartLiveRequest
+                {
+                    ExperimentId = experimentId,
+                    TrackIndex = 0,
+                },
                 headers: metadata,
                 cancellationToken: cancellationToken).ResponseAsync.ConfigureAwait(false);
 
@@ -158,14 +163,34 @@ public sealed class ZenApiCameraService : ICameraService, IZenClient, IAsyncDisp
 
             try
             {
-                await firstFrame.Task.WaitAsync(TimeSpan.FromSeconds(8), cancellationToken).ConfigureAwait(false);
+                await firstFrame.Task.WaitAsync(TimeSpan.FromSeconds(5), cancellationToken).ConfigureAwait(false);
                 SetStatus("ZEN live running");
+                return;
+            }
+            catch (TimeoutException)
+            {
+                SetStatus("ZEN StartLive: no frames yet — trying StartContinuous...");
+            }
+
+            // Some ZEN core profiles stream pixels under Continuous rather than Live.
+            await experiment.StartContinuousAsync(
+                new ExperimentServiceStartContinuousRequest { ExperimentId = experimentId },
+                headers: metadata,
+                cancellationToken: cancellationToken).ResponseAsync.ConfigureAwait(false);
+
+            SetStatus("ZEN continuous started — waiting for frames...");
+
+            try
+            {
+                await firstFrame.Task.WaitAsync(TimeSpan.FromSeconds(8), cancellationToken).ConfigureAwait(false);
+                SetStatus("ZEN live running (continuous)");
             }
             catch (TimeoutException)
             {
                 SetStatus(
-                    "ZEN live started but no pixel frames arrived. " +
-                    "Stop Live in ZEN UI, confirm experiment ROI/bit-depth, check Activity log.");
+                    "ZEN acquisition started but no pixel frames arrived. " +
+                    "In ZEN: enable API/unsupervised mode if available, stop UI Live, " +
+                    "confirm Gateway shows ZEN as provider, then retry.");
             }
         }
         catch
@@ -286,44 +311,40 @@ public sealed class ZenApiCameraService : ICameraService, IZenClient, IAsyncDisp
         TaskCompletionSource firstFrame,
         CancellationToken token)
     {
-        var skippedEmpty = 0;
         try
         {
-            // EnableRawData=true is required for ROI / partial frames (Axiocam bring-up often uses ROI).
-            var request = new ExperimentStreamingServiceMonitorExperimentRequest
-            {
-                ExperimentId = experimentId,
-                EnableRawData = true,
-            };
-            if (_options.ChannelIndex >= 0)
-                request.ChannelIndex = _options.ChannelIndex;
-
-            using var call = streaming.MonitorExperiment(request, headers: metadata, cancellationToken: token);
-            streamReady.TrySetResult();
-            SetStatus("ZEN MonitorExperiment stream open");
-
-            await foreach (var response in call.ResponseStream.ReadAllAsync(token).ConfigureAwait(false))
-            {
-                var frame = ToCameraFrame(response.FrameData, out var skipReason);
-                if (frame is null)
+            // Run both monitors: some ZEN builds only emit Live pixels on MonitorAllExperiments.
+            var experimentMonitor = ConsumeStreamAsync(
+                () =>
                 {
-                    skippedEmpty++;
-                    if (skippedEmpty is 1 or 10 or 50)
+                    var request = new ExperimentStreamingServiceMonitorExperimentRequest
                     {
-                        _logger.LogWarning(
-                            "ZEN stream skipped frame ({Count}): {Reason}",
-                            skippedEmpty,
-                            skipReason);
-                        SetStatus($"ZEN stream: skipping frames ({skipReason})");
-                    }
+                        ExperimentId = experimentId,
+                        EnableRawData = true,
+                    };
+                    // Omit ChannelIndex so ZEN returns all channels (Zeiss default).
+                    return streaming.MonitorExperiment(request, headers: metadata, cancellationToken: token);
+                },
+                "MonitorExperiment",
+                streamReady,
+                firstFrame,
+                token);
 
-                    continue;
-                }
+            var allMonitor = ConsumeStreamAsync(
+                () =>
+                {
+                    var request = new ExperimentStreamingServiceMonitorAllExperimentsRequest
+                    {
+                        EnableRawData = true,
+                    };
+                    return streaming.MonitorAllExperiments(request, headers: metadata, cancellationToken: token);
+                },
+                "MonitorAllExperiments",
+                streamReady,
+                firstFrame,
+                token);
 
-                lock (_gate) _lastFrame = frame;
-                firstFrame.TrySetResult();
-                FrameReceived?.Invoke(this, new CameraFrameEventArgs(frame));
-            }
+            await Task.WhenAll(experimentMonitor, allMonitor).ConfigureAwait(false);
 
             if (!firstFrame.Task.IsCompleted)
             {
@@ -349,6 +370,73 @@ public sealed class ZenApiCameraService : ICameraService, IZenClient, IAsyncDisp
             firstFrame.TrySetException(ex);
             lock (_gate) _live = false;
         }
+    }
+
+    private async Task ConsumeStreamAsync<TResponse>(
+        Func<AsyncServerStreamingCall<TResponse>> startCall,
+        string sourceName,
+        TaskCompletionSource streamReady,
+        TaskCompletionSource firstFrame,
+        CancellationToken token)
+        where TResponse : class
+    {
+        var skippedEmpty = 0;
+        try
+        {
+            using var call = startCall();
+            streamReady.TrySetResult();
+            SetStatus($"ZEN {sourceName} stream open");
+
+            await foreach (var response in call.ResponseStream.ReadAllAsync(token).ConfigureAwait(false))
+            {
+                var frameData = ExtractFrameData(response);
+                var frame = ToCameraFrame(frameData, out var skipReason);
+                if (frame is null)
+                {
+                    skippedEmpty++;
+                    if (skippedEmpty is 1 or 10 or 50)
+                    {
+                        _logger.LogWarning(
+                            "ZEN {Source} skipped frame ({Count}): {Reason}",
+                            sourceName,
+                            skippedEmpty,
+                            skipReason);
+                        SetStatus($"ZEN {sourceName}: skipping frames ({skipReason})");
+                    }
+
+                    continue;
+                }
+
+                lock (_gate) _lastFrame = frame;
+                if (firstFrame.TrySetResult())
+                    SetStatus($"ZEN live frame from {sourceName} ({frame.Width}x{frame.Height} {frame.PixelFormat})");
+                FrameReceived?.Invoke(this, new CameraFrameEventArgs(frame));
+            }
+        }
+        catch (OperationCanceledException) { }
+        catch (RpcException ex) when (ex.StatusCode == StatusCode.Cancelled) { }
+        catch (RpcException ex) when (ex.StatusCode == StatusCode.Unimplemented)
+        {
+            _logger.LogWarning(ex, "ZEN {Source} unimplemented on this Gateway/ZEN build", sourceName);
+            SetStatus($"ZEN {sourceName} unimplemented on this ZEN build");
+            streamReady.TrySetResult(); // allow StartLive to proceed using the other monitor
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "ZEN {Source} ended with error", sourceName);
+            SetStatus($"ZEN {sourceName} error: {ex.Message}");
+            streamReady.TrySetResult();
+        }
+    }
+
+    private static FrameData? ExtractFrameData<TResponse>(TResponse response)
+    {
+        return response switch
+        {
+            ExperimentStreamingServiceMonitorExperimentResponse exp => exp.FrameData,
+            ExperimentStreamingServiceMonitorAllExperimentsResponse all => all.FrameData,
+            _ => null,
+        };
     }
 
     private static CameraFrame? ToCameraFrame(FrameData? data, out string skipReason)

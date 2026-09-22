@@ -14,7 +14,18 @@ message ExperimentStreamingServiceMonitorExperimentResponse {
   FrameData frame_data = 1;
 }
 
+message ExperimentStreamingServiceMonitorAllExperimentsRequest {
+  google.protobuf.Int32Value channel_index = 1;
+  bool enable_raw_data = 2;
+}
+
+message ExperimentStreamingServiceMonitorAllExperimentsResponse {
+  FrameData frame_data = 1;
+}
+
 service ExperimentStreamingService {
   rpc MonitorExperiment(ExperimentStreamingServiceMonitorExperimentRequest)
       returns (stream ExperimentStreamingServiceMonitorExperimentResponse);
+  rpc MonitorAllExperiments(ExperimentStreamingServiceMonitorAllExperimentsRequest)
+      returns (stream ExperimentStreamingServiceMonitorAllExperimentsResponse);
 }
