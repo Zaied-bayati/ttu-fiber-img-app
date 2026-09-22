@@ -224,6 +224,22 @@ public partial class CaptureViewModel : ObservableObject
             await _camera.StartLiveAsync();
             Trace(_camera.Status);
             ShowPlaceholderOverlay = false;
+
+            // StartLive can succeed while the pixel stream never delivers frames.
+            if (PreviewImage is null)
+            {
+                for (var i = 0; i < 20 && PreviewImage is null; i++)
+                    await Task.Delay(100);
+
+                if (PreviewImage is null)
+                {
+                    BannerMessage =
+                        string.IsNullOrWhiteSpace(_camera.Status)
+                            ? "Live started but no image yet. Check Activity log / stop Live in ZEN first."
+                            : _camera.Status;
+                    Trace($"No preview frame after Start live. Status={_camera.Status}");
+                }
+            }
         }
         catch (Exception ex)
         {

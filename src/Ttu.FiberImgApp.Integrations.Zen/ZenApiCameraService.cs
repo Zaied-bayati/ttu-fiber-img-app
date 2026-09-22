@@ -125,20 +125,54 @@ public sealed class ZenApiCameraService : ICameraService, IZenClient, IAsyncDisp
             metadata = _metadata;
         }
 
-        await experiment.StartLiveAsync(
-            new ExperimentServiceStartLiveRequest { ExperimentId = experimentId },
-            headers: metadata,
-            cancellationToken: cancellationToken).ResponseAsync.ConfigureAwait(false);
-
+        // Subscribe to the pixel stream before StartLive so ROI/partial frames are not missed.
         var cts = new CancellationTokenSource();
+        var streamReady = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var firstFrame = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         lock (_gate)
         {
             _liveCts = cts;
             _live = true;
-            _liveLoop = Task.Run(() => StreamLoopAsync(streaming, metadata, experimentId, cts.Token), cts.Token);
+            _liveLoop = Task.Run(
+                () => StreamLoopAsync(streaming, metadata, experimentId, streamReady, firstFrame, cts.Token),
+                cts.Token);
         }
 
-        SetStatus("ZEN live running");
+        try
+        {
+            try
+            {
+                await streamReady.Task.WaitAsync(TimeSpan.FromSeconds(5), cancellationToken).ConfigureAwait(false);
+            }
+            catch (TimeoutException)
+            {
+                SetStatus("ZEN: timed out opening MonitorExperiment stream");
+            }
+
+            await experiment.StartLiveAsync(
+                new ExperimentServiceStartLiveRequest { ExperimentId = experimentId },
+                headers: metadata,
+                cancellationToken: cancellationToken).ResponseAsync.ConfigureAwait(false);
+
+            SetStatus("ZEN live started — waiting for frames...");
+
+            try
+            {
+                await firstFrame.Task.WaitAsync(TimeSpan.FromSeconds(8), cancellationToken).ConfigureAwait(false);
+                SetStatus("ZEN live running");
+            }
+            catch (TimeoutException)
+            {
+                SetStatus(
+                    "ZEN live started but no pixel frames arrived. " +
+                    "Stop Live in ZEN UI, confirm experiment ROI/bit-depth, check Activity log.");
+            }
+        }
+        catch
+        {
+            await StopLiveAsync(CancellationToken.None).ConfigureAwait(false);
+            throw;
+        }
     }
 
     public async Task StopLiveAsync(CancellationToken cancellationToken = default)
@@ -248,42 +282,96 @@ public sealed class ZenApiCameraService : ICameraService, IZenClient, IAsyncDisp
         ExperimentStreamingService.ExperimentStreamingServiceClient streaming,
         Metadata metadata,
         string experimentId,
+        TaskCompletionSource streamReady,
+        TaskCompletionSource firstFrame,
         CancellationToken token)
     {
+        var skippedEmpty = 0;
         try
         {
+            // EnableRawData=true is required for ROI / partial frames (Axiocam bring-up often uses ROI).
             var request = new ExperimentStreamingServiceMonitorExperimentRequest
             {
                 ExperimentId = experimentId,
-                EnableRawData = false,
-                ChannelIndex = _options.ChannelIndex,
+                EnableRawData = true,
             };
+            if (_options.ChannelIndex >= 0)
+                request.ChannelIndex = _options.ChannelIndex;
 
             using var call = streaming.MonitorExperiment(request, headers: metadata, cancellationToken: token);
+            streamReady.TrySetResult();
+            SetStatus("ZEN MonitorExperiment stream open");
+
             await foreach (var response in call.ResponseStream.ReadAllAsync(token).ConfigureAwait(false))
             {
-                var frame = ToCameraFrame(response.FrameData);
-                if (frame is null) continue;
+                var frame = ToCameraFrame(response.FrameData, out var skipReason);
+                if (frame is null)
+                {
+                    skippedEmpty++;
+                    if (skippedEmpty is 1 or 10 or 50)
+                    {
+                        _logger.LogWarning(
+                            "ZEN stream skipped frame ({Count}): {Reason}",
+                            skippedEmpty,
+                            skipReason);
+                        SetStatus($"ZEN stream: skipping frames ({skipReason})");
+                    }
+
+                    continue;
+                }
 
                 lock (_gate) _lastFrame = frame;
+                firstFrame.TrySetResult();
                 FrameReceived?.Invoke(this, new CameraFrameEventArgs(frame));
             }
+
+            if (!firstFrame.Task.IsCompleted)
+            {
+                SetStatus("ZEN stream ended without any usable pixel frames");
+                firstFrame.TrySetException(new InvalidOperationException("ZEN stream ended without frames."));
+            }
         }
-        catch (OperationCanceledException) { }
-        catch (RpcException ex) when (ex.StatusCode == StatusCode.Cancelled) { }
+        catch (OperationCanceledException)
+        {
+            streamReady.TrySetCanceled(token);
+            firstFrame.TrySetCanceled(token);
+        }
+        catch (RpcException ex) when (ex.StatusCode == StatusCode.Cancelled)
+        {
+            streamReady.TrySetCanceled();
+            firstFrame.TrySetCanceled();
+        }
         catch (Exception ex)
         {
             _logger.LogError(ex, "ZEN stream failed");
             SetStatus($"ZEN stream error: {ex.Message}");
+            streamReady.TrySetException(ex);
+            firstFrame.TrySetException(ex);
             lock (_gate) _live = false;
         }
     }
 
-    private static CameraFrame? ToCameraFrame(FrameData? data)
+    private static CameraFrame? ToCameraFrame(FrameData? data, out string skipReason)
     {
-        if (data?.PixelData is null || data.FrameSize is null) return null;
+        skipReason = string.Empty;
+        if (data is null)
+        {
+            skipReason = "FrameData is null";
+            return null;
+        }
+
+        if (data.PixelData is null)
+        {
+            skipReason = "PixelData is null";
+            return null;
+        }
+
         var pixels = data.PixelData.RawData.ToByteArray();
-        if (pixels.Length == 0) return null;
+        if (pixels.Length == 0)
+        {
+            skipReason = "RawData is empty (try EnableRawData / check experiment is acquiring)";
+            return null;
+        }
 
         var format = data.PixelData.PixelType switch
         {
@@ -291,12 +379,28 @@ public sealed class ZenApiCameraService : ICameraService, IZenClient, IAsyncDisp
             PixelType.Gray16 => CameraPixelFormat.Gray16,
             PixelType.Bgr24 => CameraPixelFormat.Bgr24,
             PixelType.Bgr48 => CameraPixelFormat.Bgr48,
-            _ => CameraPixelFormat.Gray16,
+            PixelType.Unspecified => InferFormatFromByteLength(pixels.Length, data),
+            _ => InferFormatFromByteLength(pixels.Length, data),
         };
 
-        var width = data.PixelData.Size?.Width > 0 ? data.PixelData.Size.Width : data.FrameSize.Width;
-        var height = data.PixelData.Size?.Height > 0 ? data.PixelData.Size.Height : data.FrameSize.Height;
-        if (width <= 0 || height <= 0) return null;
+        var width = data.PixelData.Size?.Width > 0
+            ? data.PixelData.Size.Width
+            : data.FrameSize?.Width ?? 0;
+        var height = data.PixelData.Size?.Height > 0
+            ? data.PixelData.Size.Height
+            : data.FrameSize?.Height ?? 0;
+        if (width <= 0 || height <= 0)
+        {
+            skipReason = "Width/Height missing on frame";
+            return null;
+        }
+
+        var expected = ExpectedByteLength(format, width, height);
+        if (expected > 0 && pixels.Length < expected)
+        {
+            skipReason = $"Got {pixels.Length} bytes, expected >= {expected} for {width}x{height} {format}";
+            return null;
+        }
 
         return new CameraFrame
         {
@@ -305,6 +409,32 @@ public sealed class ZenApiCameraService : ICameraService, IZenClient, IAsyncDisp
             Height = height,
             PixelFormat = format,
             CapturedAt = DateTimeOffset.UtcNow,
+        };
+    }
+
+    private static CameraPixelFormat InferFormatFromByteLength(int byteLength, FrameData data)
+    {
+        var width = data.PixelData?.Size?.Width > 0 ? data.PixelData.Size.Width : data.FrameSize?.Width ?? 0;
+        var height = data.PixelData?.Size?.Height > 0 ? data.PixelData.Size.Height : data.FrameSize?.Height ?? 0;
+        if (width <= 0 || height <= 0) return CameraPixelFormat.Gray8;
+
+        var pixels = width * height;
+        if (byteLength >= pixels * 6) return CameraPixelFormat.Bgr48;
+        if (byteLength >= pixels * 3) return CameraPixelFormat.Bgr24;
+        if (byteLength >= pixels * 2) return CameraPixelFormat.Gray16;
+        return CameraPixelFormat.Gray8;
+    }
+
+    private static int ExpectedByteLength(CameraPixelFormat format, int width, int height)
+    {
+        var pixels = checked(width * height);
+        return format switch
+        {
+            CameraPixelFormat.Gray8 => pixels,
+            CameraPixelFormat.Gray16 => pixels * 2,
+            CameraPixelFormat.Bgr24 => pixels * 3,
+            CameraPixelFormat.Bgr48 => pixels * 6,
+            _ => 0,
         };
     }
 
