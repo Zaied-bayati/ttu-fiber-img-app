@@ -53,17 +53,27 @@ public sealed class SessionExportService : ISessionExportService
         foreach (var image in kept)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            var stamp = image.CapturedAt.ToLocalTime().ToString("yyyyMMdd_HHmmss");
-            var fileName = $"{stamp}_{image.Index:000}.png";
+            var stamp = image.CapturedAt.ToLocalTime().ToString("yyyyMMdd_HHmmss_fff");
+            var baseName = $"{stamp}_{image.Index:000}";
+            var fileName = UniqueName(sessionDir, baseName, ".png");
             var path = Path.Combine(sessionDir, fileName);
             await File.WriteAllBytesAsync(path, image.PngBytes, cancellationToken).ConfigureAwait(false);
+
+            var cziName = CopyIfPresent(sessionDir, baseName, ".czi", image.CziPath);
+            var tiffName = CopyIfPresent(sessionDir, baseName, ".tif", image.TiffPath);
 
             metadata.Add(new
             {
                 image.Index,
                 image.PositionMm,
                 CapturedAt = image.CapturedAt,
-                FileName = fileName
+                image.Width,
+                image.Height,
+                image.PixelFormat,
+                FileName = fileName,
+                CziFileName = cziName,
+                TiffFileName = tiffName,
+                SourceCzi = image.CziPath
             });
         }
 
@@ -86,5 +96,31 @@ public sealed class SessionExportService : ISessionExportService
 
         _logger.LogInformation("Saved {Count} images to {Folder}", kept.Count, sessionDir);
         return sessionDir;
+    }
+
+    private static string? CopyIfPresent(string sessionDir, string baseName, string extension, string? sourcePath)
+    {
+        if (string.IsNullOrWhiteSpace(sourcePath) || !File.Exists(sourcePath))
+            return null;
+
+        var fileName = UniqueName(sessionDir, baseName, extension);
+        var destination = Path.Combine(sessionDir, fileName);
+        File.Copy(sourcePath, destination, overwrite: false);
+        return fileName;
+    }
+
+    private static string UniqueName(string directory, string baseName, string extension)
+    {
+        var candidate = baseName + extension;
+        var path = Path.Combine(directory, candidate);
+        var suffix = 2;
+        while (File.Exists(path))
+        {
+            candidate = $"{baseName}_{suffix}{extension}";
+            path = Path.Combine(directory, candidate);
+            suffix++;
+        }
+
+        return candidate;
     }
 }

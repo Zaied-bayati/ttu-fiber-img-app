@@ -34,6 +34,7 @@ public partial class CaptureViewModel : ObservableObject
     private int _previewBusy;
     private bool _subscribed;
     private int _positionPollInFlight;
+    private int _samplingRun;
 
     public CaptureViewModel(
         ICameraService camera,
@@ -85,7 +86,11 @@ public partial class CaptureViewModel : ObservableObject
 
     public bool HasBanner => !string.IsNullOrWhiteSpace(BannerMessage);
 
+    public bool CanBeginSampling => !IsBusy;
+
     partial void OnBannerMessageChanged(string value) => OnPropertyChanged(nameof(HasBanner));
+
+    partial void OnIsBusyChanged(bool value) => OnPropertyChanged(nameof(CanBeginSampling));
 
     [ObservableProperty]
     public partial bool IsBusy { get; set; }
@@ -398,15 +403,8 @@ public partial class CaptureViewModel : ObservableObject
             }
         }
 
-        if (!_camera.IsLive)
-        {
-            try { await _camera.StartLiveAsync(); }
-            catch (Exception ex)
-            {
-                BannerMessage = $"Need live camera before sampling: {ex.Message}";
-                return;
-            }
-        }
+        if (Interlocked.CompareExchange(ref _samplingRun, 1, 0) != 0)
+            return;
 
         var count = Math.Max(2, (int)Math.Round(ImageCount));
         IsBusy = true;
@@ -458,6 +456,7 @@ public partial class CaptureViewModel : ObservableObject
         }
         finally
         {
+            Interlocked.Exchange(ref _samplingRun, 0);
             IsBusy = false;
             RefreshStatus();
         }
@@ -472,6 +471,11 @@ public partial class CaptureViewModel : ObservableObject
         }
 
         IsReviewVisible = true;
+        if (ReviewImages.Count > 0)
+        {
+            PreviewImage = ReviewImages[^1].Thumbnail;
+            ShowPlaceholderOverlay = false;
+        }
     }
 
     [RelayCommand]

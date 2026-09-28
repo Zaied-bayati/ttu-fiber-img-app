@@ -82,6 +82,7 @@
                         Content="Begin Sampling"
                         Style="{StaticResource AccentButtonStyle}"
                         Command="{x:Bind ViewModel.BeginSamplingCommand}"
+                        IsEnabled="{x:Bind ViewModel.CanBeginSampling, Mode=OneWay}"
                         HorizontalAlignment="Stretch" />
                     <Button Content="Cancel" Command="{x:Bind ViewModel.CancelSamplingCommand}" HorizontalAlignment="Stretch" />
 

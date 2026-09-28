@@ -72,14 +72,22 @@ public sealed class SamplingService : ISamplingService
                     Message = $"Capturing image {imageNumber} of {imageCount} at {position:0.###} mm…"
                 });
 
-                var png = await _camera.CaptureStillAsync(cancellationToken).ConfigureAwait(false);
-                _activityLog.Write("sample", $"Captured image {imageNumber}/{imageCount} ({png.Length} bytes)");
+                var capture = await _camera.CaptureAcquisitionAsync(cancellationToken).ConfigureAwait(false);
+                var stored = string.IsNullOrWhiteSpace(capture.CziPath)
+                    ? $"{capture.PreviewPng.Length} byte preview"
+                    : capture.CziPath;
+                _activityLog.Write("sample", $"Captured image {imageNumber}/{imageCount} ({stored})");
                 session.Images.Add(new CapturedImage
                 {
                     Index = imageNumber,
                     PositionMm = position,
                     CapturedAt = DateTimeOffset.Now,
-                    PngBytes = png,
+                    PngBytes = capture.PreviewPng,
+                    CziPath = capture.CziPath,
+                    TiffPath = capture.TiffPath,
+                    Width = capture.Width,
+                    Height = capture.Height,
+                    PixelFormat = capture.PixelFormat,
                     Keep = true
                 });
             }

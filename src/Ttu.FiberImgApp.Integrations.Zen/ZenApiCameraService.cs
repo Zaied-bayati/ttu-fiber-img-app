@@ -26,6 +26,7 @@ public sealed class ZenApiCameraService : ICameraService, IZenClient, IAsyncDisp
     private readonly ILogger<ZenApiCameraService> _logger;
     private readonly IActivityLog _activityLog;
     private readonly object _gate = new();
+    private readonly SemaphoreSlim _snapLock = new(1, 1);
     private readonly ZenLiveFrameDecoder _decoder = new();
     private int _attemptId;
 
@@ -305,8 +306,290 @@ public sealed class ZenApiCameraService : ICameraService, IZenClient, IAsyncDisp
 
     public async Task<byte[]> CaptureStillAsync(CancellationToken cancellationToken = default)
     {
-        var frame = await WaitForFreshFrameAsync(cancellationToken).ConfigureAwait(false);
-        return MonoFrameEncoder.ToPng(frame);
+        var capture = await CaptureAcquisitionAsync(cancellationToken).ConfigureAwait(false);
+        return capture.PreviewPng;
+    }
+
+    public async Task<CameraCapture> CaptureAcquisitionAsync(CancellationToken cancellationToken = default)
+    {
+        await _snapLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            return await SnapAsync(cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            _snapLock.Release();
+        }
+    }
+
+    /// <summary>
+    /// ExperimentService.RunSnap acquires one image with the experiment's activated channels
+    /// and waits until ZEN finishes. ZEN writes the CZI. A short monitor collects the same
+    /// frame for the preview and a 16-bit TIFF when pixels arrive.
+    /// </summary>
+    private async Task<CameraCapture> SnapAsync(CancellationToken cancellationToken)
+    {
+        ExperimentService.ExperimentServiceClient experiment;
+        ExperimentStreamingService.ExperimentStreamingServiceClient? streaming;
+        Metadata metadata;
+        string experimentId;
+
+        lock (_gate)
+        {
+            if (!_connected || _experiment is null || _metadata is null || _experimentId is null)
+                throw new InvalidOperationException("ZEN camera is not connected.");
+            experiment = _experiment;
+            streaming = _streaming;
+            metadata = _metadata;
+            experimentId = _experimentId;
+        }
+
+        if (IsLive)
+            await StopLiveAsync(cancellationToken).ConfigureAwait(false);
+
+        await TryStopExperimentAsync(experiment, metadata, experimentId, cancellationToken).ConfigureAwait(false);
+
+        var outputDirectory = await GetImageOutputDirectoryAsync(experiment, metadata, cancellationToken).ConfigureAwait(false);
+        var outputName = UniqueOutputName(outputDirectory);
+        using var listenCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        var ready = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        int? capturedChannel = null;
+        var frameTask = streaming is null
+            ? Task.FromResult<CameraFrame?>(null)
+            : ListenForSnapFrameAsync(streaming, metadata, experimentId, ready, value => capturedChannel = value, listenCts.Token);
+
+        try
+        {
+            if (streaming is not null)
+            {
+                try
+                {
+                    await ready.Task.WaitAsync(TimeSpan.FromSeconds(8), cancellationToken).ConfigureAwait(false);
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    _logger.LogWarning(ex, "ZEN snap pixel stream did not open before RunSnap");
+                }
+            }
+
+            ExperimentServiceRunSnapResponse snap;
+            try
+            {
+                snap = await experiment.RunSnapAsync(
+                    new ExperimentServiceRunSnapRequest
+                    {
+                        ExperimentId = experimentId,
+                        OutputName = outputName,
+                    },
+                    headers: metadata,
+                    deadline: DateTime.UtcNow.AddMinutes(2),
+                    cancellationToken: cancellationToken).ResponseAsync.ConfigureAwait(false);
+            }
+            catch (RpcException ex) when (IsAlreadyActive(ex))
+            {
+                await TryStopExperimentAsync(experiment, metadata, experimentId, cancellationToken).ConfigureAwait(false);
+                snap = await experiment.RunSnapAsync(
+                    new ExperimentServiceRunSnapRequest
+                    {
+                        ExperimentId = experimentId,
+                        OutputName = outputName,
+                    },
+                    headers: metadata,
+                    deadline: DateTime.UtcNow.AddMinutes(2),
+                    cancellationToken: cancellationToken).ResponseAsync.ConfigureAwait(false);
+            }
+
+            var writtenName = string.IsNullOrWhiteSpace(snap.OutputName) ? outputName : snap.OutputName.Trim();
+            var cziPath = Path.Combine(outputDirectory, writtenName + ".czi");
+            var appeared = Environment.TickCount64;
+            while (!File.Exists(cziPath) && Environment.TickCount64 - appeared < 3000)
+                await Task.Delay(100, cancellationToken).ConfigureAwait(false);
+            if (!File.Exists(cziPath))
+            {
+                throw new FileNotFoundException(
+                    $"ZEN RunSnap finished but did not write {cziPath}. Confirm the experiment's image output folder.",
+                    cziPath);
+            }
+
+            CameraFrame? frame = null;
+            try
+            {
+                frame = await frameTask.WaitAsync(TimeSpan.FromSeconds(5), CancellationToken.None).ConfigureAwait(false);
+            }
+            catch (TimeoutException)
+            {
+                _logger.LogWarning("ZEN RunSnap wrote {Czi} but no pixel frame arrived for the preview", cziPath);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "ZEN snap preview listener failed after {Czi} was written", cziPath);
+            }
+
+            string? tiffPath = null;
+            byte[] preview;
+            if (frame is null)
+            {
+                preview = PlaceholderPreview();
+                SetStatus($"ZEN snap saved {cziPath}. No preview frame was received.");
+            }
+            else
+            {
+                preview = MonoFrameEncoder.ToPng(frame);
+                tiffPath = TryWriteTiff(outputDirectory, writtenName, frame);
+                SetStatus(
+                    $"Capture received: experiment {experimentId}, {frame.Width}x{frame.Height} {frame.PixelFormat}, " +
+                    $"channel {capturedChannel?.ToString() ?? "n/a"}, raw {frame.RawPixels.Length} bytes, CZI {cziPath}");
+                _logger.LogInformation(
+                    "Capture received: ExperimentId={ExperimentId} Width={Width} Height={Height} PixelFormat={PixelFormat} Channel={Channel} RawBytes={RawBytes} Czi={Czi} Tiff={Tiff}",
+                    experimentId,
+                    frame.Width,
+                    frame.Height,
+                    frame.PixelFormat,
+                    capturedChannel,
+                    frame.RawPixels.Length,
+                    cziPath,
+                    tiffPath);
+                lock (_gate) _lastFrame = frame;
+                try { FrameReceived?.Invoke(this, new CameraFrameEventArgs(frame)); }
+                catch (Exception ex) { _logger.LogWarning(ex, "Snap preview handler failed"); }
+            }
+
+            return new CameraCapture
+            {
+                PreviewPng = preview,
+                CziPath = cziPath,
+                TiffPath = tiffPath,
+                Width = frame?.Width ?? 0,
+                Height = frame?.Height ?? 0,
+                PixelFormat = frame?.PixelFormat.ToString(),
+                Channel = capturedChannel,
+            };
+        }
+        finally
+        {
+            listenCts.Cancel();
+            try { await frameTask.ConfigureAwait(false); }
+            catch (OperationCanceledException) { }
+            catch (Exception ex) { _logger.LogDebug(ex, "ZEN snap listener ended"); }
+        }
+    }
+
+    private async Task<string> GetImageOutputDirectoryAsync(
+        ExperimentService.ExperimentServiceClient experiment,
+        Metadata metadata,
+        CancellationToken cancellationToken)
+    {
+        var response = await experiment.GetImageOutputPathAsync(
+            new ExperimentServiceGetImageOutputPathRequest(),
+            headers: metadata,
+            deadline: DateTime.UtcNow.AddSeconds(8),
+            cancellationToken: cancellationToken).ResponseAsync.ConfigureAwait(false);
+
+        if (string.IsNullOrWhiteSpace(response.ImageOutputPath))
+            throw new InvalidOperationException("ZEN did not report an image output folder.");
+
+        Directory.CreateDirectory(response.ImageOutputPath);
+        return response.ImageOutputPath;
+    }
+
+    private static string UniqueOutputName(string directory)
+    {
+        var stamp = DateTime.Now.ToString("yyyyMMdd_HHmmss_fff");
+        var name = $"Capture_{stamp}";
+        var suffix = 2;
+        while (File.Exists(Path.Combine(directory, name + ".czi")) || File.Exists(Path.Combine(directory, name + ".tif")))
+        {
+            name = $"Capture_{stamp}_{suffix}";
+            suffix++;
+        }
+
+        return name;
+    }
+
+    private async Task<CameraFrame?> ListenForSnapFrameAsync(
+        ExperimentStreamingService.ExperimentStreamingServiceClient streaming,
+        Metadata metadata,
+        string experimentId,
+        TaskCompletionSource ready,
+        Action<int?> reportChannel,
+        CancellationToken token)
+    {
+        try
+        {
+            using var call = streaming.MonitorExperiment(
+                new ExperimentStreamingServiceMonitorExperimentRequest
+                {
+                    ExperimentId = experimentId,
+                    ChannelIndex = _options.ChannelIndex,
+                    EnableRawData = false,
+                },
+                headers: metadata,
+                cancellationToken: token);
+
+            _decoder.Reset();
+            ready.TrySetResult();
+            await foreach (var response in call.ResponseStream.ReadAllAsync(token).ConfigureAwait(false))
+            {
+                reportChannel(response.FrameData?.FramePosition?.C);
+                var frame = _decoder.Add(response.FrameData, enableRawData: false, out _);
+                if (frame is not null)
+                    return frame;
+            }
+
+            return null;
+        }
+        catch (OperationCanceledException)
+        {
+            return null;
+        }
+        catch (RpcException ex) when (ex.StatusCode == StatusCode.Cancelled)
+        {
+            return null;
+        }
+        catch (Exception ex)
+        {
+            ready.TrySetException(ex);
+            _logger.LogWarning(ex, "ZEN snap pixel stream failed");
+            return null;
+        }
+    }
+
+    private string? TryWriteTiff(string directory, string outputName, CameraFrame frame)
+    {
+        if (frame.PixelFormat is not (CameraPixelFormat.Gray8 or CameraPixelFormat.Gray16))
+        {
+            _logger.LogInformation("Skipping TIFF for {Format}; the ZEN CZI remains the master file", frame.PixelFormat);
+            return null;
+        }
+
+        var path = Path.Combine(directory, outputName + ".tif");
+        if (File.Exists(path))
+            path = Path.Combine(directory, outputName + "_" + Guid.NewGuid().ToString("N")[..8] + ".tif");
+
+        try
+        {
+            MonoTiffWriter.Write(path, frame);
+            return path;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Could not write TIFF {Path}", path);
+            return null;
+        }
+    }
+
+    private static byte[] PlaceholderPreview()
+    {
+        var pixels = new byte[32 * 32];
+        Array.Fill(pixels, (byte)32);
+        return MonoFrameEncoder.ToPng(new CameraFrame
+        {
+            RawPixels = pixels,
+            Width = 32,
+            Height = 32,
+            PixelFormat = CameraPixelFormat.Gray8,
+        });
     }
 
     public Task<byte[]> GetPreviewFrameAsync(CancellationToken cancellationToken = default)

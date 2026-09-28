@@ -29,8 +29,26 @@ message ExperimentServiceStopResponse {
   string experiment_id = 1;
 }
 
+message ExperimentServiceGetImageOutputPathRequest {
+}
+
+message ExperimentServiceGetImageOutputPathResponse {
+  string image_output_path = 1;
+}
+
+message ExperimentServiceRunSnapRequest {
+  string experiment_id = 1;
+  string output_name = 2;
+}
+
+message ExperimentServiceRunSnapResponse {
+  string output_name = 1;
+}
+
 service ExperimentService {
   rpc Load(ExperimentServiceLoadRequest) returns (ExperimentServiceLoadResponse);
+  rpc GetImageOutputPath(ExperimentServiceGetImageOutputPathRequest) returns (ExperimentServiceGetImageOutputPathResponse);
+  rpc RunSnap(ExperimentServiceRunSnapRequest) returns (ExperimentServiceRunSnapResponse);
   rpc StartLive(ExperimentServiceStartLiveRequest) returns (google.protobuf.Empty);
   rpc StartContinuous(ExperimentServiceStartContinuousRequest) returns (google.protobuf.Empty);
   rpc Stop(ExperimentServiceStopRequest) returns (ExperimentServiceStopResponse);
