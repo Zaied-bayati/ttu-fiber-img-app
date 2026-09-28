@@ -20,8 +20,8 @@ public sealed class ZenOptions
     /// <summary>Optional path to Gateway CA certificate (.pem/.crt). Empty = use system trust store.</summary>
     public string CertificatePath { get; set; } = string.Empty;
 
-    /// <summary>Channel index for mono streaming (typically 0).</summary>
-    public int ChannelIndex { get; set; } = 0;
+    /// <summary>Channel index for the Axiocam stream. This instrument uses channel 1.</summary>
+    public int ChannelIndex { get; set; } = 1;
 
     /// <summary>When true, skip TLS certificate validation (lab debugging only).</summary>
     public bool AllowUntrustedCertificate { get; set; } = false;
