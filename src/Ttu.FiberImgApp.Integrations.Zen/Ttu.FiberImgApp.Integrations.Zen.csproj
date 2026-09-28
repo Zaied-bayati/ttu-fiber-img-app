@@ -8,6 +8,10 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <InternalsVisibleTo Include="Ttu.FiberImgApp.Infrastructure.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
     <ProjectReference Include="..\Ttu.FiberImgApp.Core\Ttu.FiberImgApp.Core.csproj" />
     <ProjectReference Include="..\Ttu.FiberImgApp.Infrastructure\Ttu.FiberImgApp.Infrastructure.csproj" />
   </ItemGroup>

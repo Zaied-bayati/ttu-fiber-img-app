@@ -23,6 +23,7 @@
   <ItemGroup>
     <ProjectReference Include="..\..\src\Ttu.FiberImgApp.Infrastructure\Ttu.FiberImgApp.Infrastructure.csproj" />
     <ProjectReference Include="..\..\src\Ttu.FiberImgApp.Core\Ttu.FiberImgApp.Core.csproj" />
+    <ProjectReference Include="..\..\src\Ttu.FiberImgApp.Integrations.Zen\Ttu.FiberImgApp.Integrations.Zen.csproj" />
   </ItemGroup>
 
 </Project>

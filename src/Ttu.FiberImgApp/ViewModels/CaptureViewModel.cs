@@ -27,8 +27,10 @@ public partial class CaptureViewModel : ObservableObject
     private readonly DispatcherQueue _dispatcher;
     private readonly DispatcherQueueTimer _positionTimer;
     private CancellationTokenSource? _runCts;
+    private readonly object _previewGate = new();
     private WriteableBitmap? _liveBitmap;
     private FullscreenImageWindow? _liveFullscreen;
+    private CameraFrame? _pendingFrame;
     private int _previewBusy;
     private bool _subscribed;
     private int _positionPollInFlight;
@@ -533,47 +535,94 @@ public partial class CaptureViewModel : ObservableObject
 
     private void OnFrameReceived(object? sender, CameraFrameEventArgs e)
     {
-        if (Interlocked.Exchange(ref _previewBusy, 1) == 1)
-            return;
-
-        var frame = e.Frame;
-        _ = Task.Run(() =>
+        bool start;
+        lock (_previewGate)
         {
-            MonoFrameEncoder.PreviewBitmap preview;
+            _pendingFrame = e.Frame;
+            start = _previewBusy == 0;
+            if (start)
+                _previewBusy = 1;
+        }
+
+        if (start)
+            _ = Task.Run(ConvertLatestFrame);
+    }
+
+    /// <summary>
+    /// Converts only the newest frame. Frames that arrive during conversion replace the pending
+    /// slot and the older one is never expanded to BGRA.
+    /// </summary>
+    private void ConvertLatestFrame()
+    {
+        CameraFrame? frame;
+        lock (_previewGate)
+        {
+            frame = _pendingFrame;
+            _pendingFrame = null;
+        }
+
+        if (frame is null)
+        {
+            ScheduleNextPreview();
+            return;
+        }
+
+        MonoFrameEncoder.PreviewBitmap preview;
+        try
+        {
+            preview = MonoFrameEncoder.ToPreviewBgra32(frame);
+        }
+        catch (Exception ex)
+        {
+            _dispatcher.TryEnqueue(() => BannerMessage = $"Live frame error: {ex.Message}");
+            ScheduleNextPreview();
+            return;
+        }
+
+        lock (_previewGate)
+        {
+            if (_pendingFrame is not null)
+            {
+                ScheduleNextPreview();
+                return;
+            }
+        }
+
+        var queued = _dispatcher.TryEnqueue(() =>
+        {
             try
             {
-                preview = MonoFrameEncoder.ToPreviewBgra32(frame);
+                UpdateLiveBitmap(preview.Bgra, preview.Width, preview.Height);
+                ShowPlaceholderOverlay = false;
+                IsLive = true;
+                CameraStatus = _camera.Status;
+                _liveFullscreen?.SetImageSource(PreviewImage);
             }
             catch (Exception ex)
             {
-                Interlocked.Exchange(ref _previewBusy, 0);
-                _dispatcher.TryEnqueue(() => BannerMessage = $"Live frame error: {ex.Message}");
-                return;
+                BannerMessage = $"Live frame error: {ex.Message}";
             }
-
-            var queued = _dispatcher.TryEnqueue(() =>
+            finally
             {
-                try
-                {
-                    UpdateLiveBitmap(preview.Bgra, preview.Width, preview.Height);
-                    ShowPlaceholderOverlay = false;
-                    IsLive = true;
-                    CameraStatus = _camera.Status;
-                    _liveFullscreen?.SetImageSource(PreviewImage);
-                }
-                catch (Exception ex)
-                {
-                    BannerMessage = $"Live frame error: {ex.Message}";
-                }
-                finally
-                {
-                    Interlocked.Exchange(ref _previewBusy, 0);
-                }
-            });
-
-            if (!queued)
-                Interlocked.Exchange(ref _previewBusy, 0);
+                ScheduleNextPreview();
+            }
         });
+
+        if (!queued)
+            ScheduleNextPreview();
+    }
+
+    private void ScheduleNextPreview()
+    {
+        bool start;
+        lock (_previewGate)
+        {
+            start = _pendingFrame is not null;
+            _previewBusy = start ? 1 : 0;
+        }
+
+        if (start)
+            _ = Task.Run(ConvertLatestFrame);
     }
 
     private void UpdateLiveBitmap(byte[] bgra, int width, int height)

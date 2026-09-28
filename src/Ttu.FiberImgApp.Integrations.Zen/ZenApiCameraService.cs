@@ -14,9 +14,11 @@ namespace Ttu.FiberImgApp.Integrations.Zen;
 
 /// <summary>
 /// Axiocam / ZEN live + still capture via the ZEN API Gateway (gRPC over TLS).
-/// Live pixels are possible: ZEN acquires the camera and ExperimentStreamingService
-/// pushes FrameData. This app does not talk to the Axiocam over USB.
-/// Stills are encoded from the latest streamed frame (PNG).
+/// Live pixels follow the ZEN API streaming sample: ZEN acquires, then
+/// ExperimentStreamingService.MonitorExperiment (or MonitorAllExperiments when Live
+/// was started in the ZEN window) pushes FrameData. This app reads PixelData.RawData
+/// on a background task and keeps only the newest frame for the UI.
+/// Stills are encoded from that latest frame (PNG).
 /// </summary>
 public sealed class ZenApiCameraService : ICameraService, IZenClient, IAsyncDisposable
 {
@@ -24,7 +26,8 @@ public sealed class ZenApiCameraService : ICameraService, IZenClient, IAsyncDisp
     private readonly ILogger<ZenApiCameraService> _logger;
     private readonly IActivityLog _activityLog;
     private readonly object _gate = new();
-    private readonly LiveFrameAssembler _assembler = new();
+    private readonly ZenLiveFrameDecoder _decoder = new();
+    private int _attemptId;
 
     private GrpcChannel? _channel;
     private ExperimentService.ExperimentServiceClient? _experiment;
@@ -162,15 +165,16 @@ public sealed class ZenApiCameraService : ICameraService, IZenClient, IAsyncDisp
         {
             if (!_connected || _experiment is null || _streaming is null || _metadata is null || _experimentId is null)
                 throw new InvalidOperationException("Connect to ZEN before starting live.");
-            if (_live) return;
+            if (_live && _liveLoop is { IsCompleted: false })
+                return;
             experimentId = _experimentId;
             experiment = _experiment;
             streaming = _streaming;
             metadata = _metadata;
-            _frameTooLarge = false;
-            _streamMessages = 0;
-            _lastSkip = string.Empty;
         }
+
+        if (_live || _liveLoop is not null)
+            await StopLiveAsync(cancellationToken).ConfigureAwait(false);
 
         await TryStopExperimentAsync(experiment, metadata, experimentId, cancellationToken).ConfigureAwait(false);
 
@@ -179,17 +183,20 @@ public sealed class ZenApiCameraService : ICameraService, IZenClient, IAsyncDisp
         {
             _liveCts = cts;
             _live = true;
-            _assembler.Reset();
+            _frameTooLarge = false;
+            _streamMessages = 0;
+            _lastSkip = string.Empty;
+            _decoder.Reset();
         }
 
-        // The pixel stream must stay tied to _liveCts. Disposing a linked token when StartLiveAsync
-        // returns would cancel the stream as soon as the first frame arrived.
+        // The pixel stream stays tied to this CTS until Stop. The read loop runs on the thread pool;
+        // cancelling it here (when StartLiveAsync returns) would drop the stream after the first frame.
         try
         {
             var controlling = await TryStartAcquisitionAsync(experiment, metadata, experimentId, live: true, cancellationToken)
                 .ConfigureAwait(false);
 
-            if (await WatchForFramesAsync(streaming, metadata, experimentId, cts.Token, cancellationToken).ConfigureAwait(false))
+            if (await WatchForFramesAsync(streaming, metadata, experimentId, controlling, cts.Token, cancellationToken).ConfigureAwait(false))
             {
                 SetStatus(controlling ? "ZEN live running" : "ZEN live running (stream from ZEN UI)");
                 return;
@@ -197,16 +204,19 @@ public sealed class ZenApiCameraService : ICameraService, IZenClient, IAsyncDisp
 
             if (_frameTooLarge)
                 throw new InvalidOperationException(Status);
+            cancellationToken.ThrowIfCancellationRequested();
+            if (IsCancelled(cts))
+                throw new OperationCanceledException();
 
             if (controlling)
             {
                 SetStatus("ZEN StartLive produced no frames — stopping, then StartContinuous...");
                 await TryStopExperimentAsync(experiment, metadata, experimentId, cancellationToken).ConfigureAwait(false);
-                _assembler.Reset();
+                _decoder.Reset();
                 await TryStartAcquisitionAsync(experiment, metadata, experimentId, live: false, cancellationToken)
                     .ConfigureAwait(false);
 
-                if (await WatchForFramesAsync(streaming, metadata, experimentId, cts.Token, cancellationToken).ConfigureAwait(false))
+                if (await WatchForFramesAsync(streaming, metadata, experimentId, controlling: true, cts.Token, cancellationToken).ConfigureAwait(false))
                 {
                     SetStatus("ZEN live running (continuous)");
                     return;
@@ -239,6 +249,9 @@ public sealed class ZenApiCameraService : ICameraService, IZenClient, IAsyncDisp
 
     public async Task StopLiveAsync(CancellationToken cancellationToken = default)
     {
+        // Invalidate in-flight attempts so a late frame cannot be treated as a successful start.
+        Interlocked.Increment(ref _attemptId);
+
         CancellationTokenSource? cts;
         CancellationTokenSource? streamCts;
         Task? loop;
@@ -260,17 +273,17 @@ public sealed class ZenApiCameraService : ICameraService, IZenClient, IAsyncDisp
             _live = false;
         }
 
-        streamCts?.Cancel();
-        cts?.Cancel();
+        CancelQuiet(streamCts);
+        CancelQuiet(cts);
         try { if (loop is not null) await loop.ConfigureAwait(false); }
         catch (OperationCanceledException) { }
         finally
         {
-            streamCts?.Dispose();
-            cts?.Dispose();
+            DisposeQuiet(streamCts);
+            DisposeQuiet(cts);
         }
 
-        _assembler.Reset();
+        _decoder.Reset();
 
         if (experiment is not null && metadata is not null && !string.IsNullOrEmpty(experimentId))
         {
@@ -404,21 +417,33 @@ public sealed class ZenApiCameraService : ICameraService, IZenClient, IAsyncDisp
         ExperimentStreamingService.ExperimentStreamingServiceClient streaming,
         Metadata metadata,
         string experimentId,
+        bool controlling,
         CancellationToken liveToken,
         CancellationToken cancellationToken)
     {
-        // LM cameras (Axiocam) emit a full frame per message. Cancelling the stream every few
-        // seconds aborts that transfer before gRPC can deliver it, which looks like "no pixels".
-        var attempts = new (bool AllExperiments, bool EnableRawData, string Label, TimeSpan Timeout)[]
-        {
-            (false, true, "MonitorExperiment", TimeSpan.FromSeconds(20)),
-            (true, true, "MonitorAllExperiments", TimeSpan.FromSeconds(15)),
-            (false, false, "MonitorExperiment assembled frames", TimeSpan.FromSeconds(12)),
-        };
+        // Official zenapi_streaming.py keeps one stream open and reads complete frames
+        // (enable_raw_data false, shaped by FrameSize). Partial/raw mode is only a fallback.
+        // API-started acquisition is MonitorExperiment; Live started in the ZEN window is
+        // MonitorAllExperiments. A full Axiocam frame is one gRPC message — do not cancel
+        // that call on a short timer while bytes are still arriving.
+        var attempts = controlling
+            ? new (bool AllExperiments, bool EnableRawData, string Label, TimeSpan Timeout)[]
+            {
+                (false, false, "MonitorExperiment", TimeSpan.FromSeconds(12)),
+                (false, true, "MonitorExperiment partial frames", TimeSpan.FromSeconds(10)),
+                (true, false, "MonitorAllExperiments", TimeSpan.FromSeconds(8)),
+            }
+            : new (bool AllExperiments, bool EnableRawData, string Label, TimeSpan Timeout)[]
+            {
+                (true, false, "MonitorAllExperiments", TimeSpan.FromSeconds(12)),
+                (true, true, "MonitorAllExperiments partial frames", TimeSpan.FromSeconds(8)),
+                (false, false, "MonitorExperiment", TimeSpan.FromSeconds(8)),
+            };
 
         foreach (var attempt in attempts)
         {
             cancellationToken.ThrowIfCancellationRequested();
+            liveToken.ThrowIfCancellationRequested();
             if (_frameTooLarge)
                 return false;
 
@@ -435,8 +460,6 @@ public sealed class ZenApiCameraService : ICameraService, IZenClient, IAsyncDisp
 
             if (hit == MonitorHit.Frame)
                 return true;
-            if (hit == MonitorHit.NeedRawData)
-                continue;
         }
 
         return false;
@@ -452,28 +475,29 @@ public sealed class ZenApiCameraService : ICameraService, IZenClient, IAsyncDisp
         CancellationToken liveToken,
         CancellationToken cancellationToken)
     {
+        var attemptId = Interlocked.Increment(ref _attemptId);
         var attempt = CancellationTokenSource.CreateLinkedTokenSource(liveToken);
         var first = new TaskCompletionSource<MonitorHit>(TaskCreationOptions.RunContinuationsAsynchronously);
-        _assembler.Reset();
+        _decoder.Reset();
         var loop = Task.Run(
-            () => ConsumeAsync(streaming, metadata, experimentId, allExperiments, enableRawData, first, attempt.Token));
+            () => ConsumeAsync(streaming, metadata, experimentId, allExperiments, enableRawData, attemptId, first, attempt.Token),
+            CancellationToken.None);
+
+        lock (_gate)
+        {
+            _streamCts = attempt;
+            _liveLoop = loop;
+        }
 
         try
         {
             var hit = await first.Task.WaitAsync(timeout, cancellationToken).ConfigureAwait(false);
-            if (hit == MonitorHit.Frame)
-            {
-                lock (_gate)
-                {
-                    _streamCts = attempt;
-                    _liveLoop = loop;
-                }
-
+            liveToken.ThrowIfCancellationRequested();
+            if (hit == MonitorHit.Frame && attemptId == Volatile.Read(ref _attemptId))
                 return MonitorHit.Frame;
-            }
 
             await CancelAttemptAsync(attempt, loop).ConfigureAwait(false);
-            return hit;
+            return hit == MonitorHit.Frame ? MonitorHit.None : hit;
         }
         catch (TimeoutException)
         {
@@ -493,13 +517,22 @@ public sealed class ZenApiCameraService : ICameraService, IZenClient, IAsyncDisp
         }
     }
 
-    private static async Task CancelAttemptAsync(CancellationTokenSource attempt, Task loop)
+    private async Task CancelAttemptAsync(CancellationTokenSource attempt, Task loop)
     {
-        attempt.Cancel();
+        CancelQuiet(attempt);
         try { await loop.ConfigureAwait(false); }
         catch (OperationCanceledException) { }
         catch (Exception) { }
-        finally { attempt.Dispose(); }
+
+        lock (_gate)
+        {
+            if (ReferenceEquals(_streamCts, attempt))
+                _streamCts = null;
+            if (_liveLoop == loop)
+                _liveLoop = null;
+        }
+
+        DisposeQuiet(attempt);
     }
 
     private async Task ConsumeAsync(
@@ -508,15 +541,21 @@ public sealed class ZenApiCameraService : ICameraService, IZenClient, IAsyncDisp
         string experimentId,
         bool allExperiments,
         bool enableRawData,
+        int attemptId,
         TaskCompletionSource<MonitorHit> first,
         CancellationToken token)
     {
         var sourceName = allExperiments ? "MonitorAllExperiments" : "MonitorExperiment";
         try
         {
+            var channelIndex = _options.ChannelIndex;
             using var call = allExperiments
                 ? streaming.MonitorAllExperiments(
-                    new ExperimentStreamingServiceMonitorAllExperimentsRequest { EnableRawData = enableRawData },
+                    new ExperimentStreamingServiceMonitorAllExperimentsRequest
+                    {
+                        ChannelIndex = channelIndex,
+                        EnableRawData = enableRawData,
+                    },
                     headers: metadata,
                     cancellationToken: token)
                 : null;
@@ -527,22 +566,23 @@ public sealed class ZenApiCameraService : ICameraService, IZenClient, IAsyncDisp
                     new ExperimentStreamingServiceMonitorExperimentRequest
                     {
                         ExperimentId = experimentId,
+                        ChannelIndex = channelIndex,
                         EnableRawData = enableRawData,
                     },
                     headers: metadata,
                     cancellationToken: token);
 
-            SetStatus($"ZEN {sourceName} stream open (raw data {enableRawData})");
+            SetStatus($"ZEN {sourceName} stream open (complete frames {!enableRawData}, channel {channelIndex})");
 
             if (allExperiments)
             {
                 await foreach (var response in call!.ResponseStream.ReadAllAsync(token).ConfigureAwait(false))
-                    Publish(response.FrameData, sourceName, enableRawData, first);
+                    Publish(response.FrameData, sourceName, enableRawData, attemptId, first);
             }
             else
             {
                 await foreach (var response in experimentCall!.ResponseStream.ReadAllAsync(token).ConfigureAwait(false))
-                    Publish(response.FrameData, sourceName, enableRawData, first);
+                    Publish(response.FrameData, sourceName, enableRawData, attemptId, first);
             }
 
             NoteKeptStreamEnded(first);
@@ -601,17 +641,30 @@ public sealed class ZenApiCameraService : ICameraService, IZenClient, IAsyncDisp
         return true;
     }
 
-    private void Publish(FrameData? data, string sourceName, bool enableRawData, TaskCompletionSource<MonitorHit> first)
+    private void Publish(
+        FrameData? data,
+        string sourceName,
+        bool enableRawData,
+        int attemptId,
+        TaskCompletionSource<MonitorHit> first)
     {
+        if (attemptId != Volatile.Read(ref _attemptId))
+            return;
+
         var count = Interlocked.Increment(ref _streamMessages);
-        var frame = _assembler.Add(data, out var skipReason);
+        var frame = _decoder.Add(data, enableRawData, out var skipReason);
+        if (attemptId != Volatile.Read(ref _attemptId))
+            return;
+
         if (frame is null)
         {
             if (!string.IsNullOrEmpty(skipReason))
                 _lastSkip = skipReason;
 
             // One empty prelude is normal. Leave the stream open so the following full frame can arrive.
-            if (skipReason.Contains("RawData is empty", StringComparison.Ordinal) && count >= (enableRawData ? 40 : 8))
+            var giveUp = skipReason.Contains("RawData is empty", StringComparison.Ordinal) && count >= (enableRawData ? 40 : 8)
+                || skipReason.Contains("expected", StringComparison.Ordinal) && count >= (enableRawData ? 20 : 5);
+            if (giveUp)
                 first.TrySetResult(MonitorHit.NeedRawData);
             else if (!string.IsNullOrEmpty(skipReason)
                      && !skipReason.StartsWith("buffering", StringComparison.Ordinal)
@@ -623,7 +676,15 @@ public sealed class ZenApiCameraService : ICameraService, IZenClient, IAsyncDisp
         lock (_gate) _lastFrame = frame;
         if (first.TrySetResult(MonitorHit.Frame))
             SetStatus($"ZEN live frame from {sourceName} ({frame.Width}x{frame.Height} {frame.PixelFormat})");
-        FrameReceived?.Invoke(this, new CameraFrameEventArgs(frame));
+
+        try
+        {
+            FrameReceived?.Invoke(this, new CameraFrameEventArgs(frame));
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Live frame handler failed");
+        }
     }
 
     private async Task TryStopExperimentAsync(
@@ -668,6 +729,26 @@ public sealed class ZenApiCameraService : ICameraService, IZenClient, IAsyncDisp
         return false;
     }
 
+    private static bool IsCancelled(CancellationTokenSource cts)
+    {
+        try { return cts.IsCancellationRequested; }
+        catch (ObjectDisposedException) { return true; }
+    }
+
+    private static void CancelQuiet(CancellationTokenSource? cts)
+    {
+        if (cts is null) return;
+        try { cts.Cancel(); }
+        catch (ObjectDisposedException) { }
+    }
+
+    private static void DisposeQuiet(CancellationTokenSource? cts)
+    {
+        if (cts is null) return;
+        try { cts.Dispose(); }
+        catch (ObjectDisposedException) { }
+    }
+
     private void SetStatus(string status)
     {
         lock (_gate) _status = status;
@@ -681,8 +762,17 @@ public sealed class ZenApiCameraService : ICameraService, IZenClient, IAsyncDisp
         _experiment = null;
         _streaming = null;
         _metadata = null;
-        if (channel is not null)
+        if (channel is null)
+            return;
+
+        try
+        {
             await channel.ShutdownAsync().ConfigureAwait(false);
+        }
+        finally
+        {
+            channel.Dispose();
+        }
     }
 
     public async ValueTask DisposeAsync()
@@ -696,173 +786,5 @@ public sealed class ZenApiCameraService : ICameraService, IZenClient, IAsyncDisp
         Frame = 1,
         NeedRawData = 2,
         Failed = 3,
-    }
-
-    /// <summary>
-    /// Stitches Gateway tiles / scan lines into one image. A full-frame packet is returned as-is.
-    /// </summary>
-    private sealed class LiveFrameAssembler
-    {
-        private byte[] _pixels = [];
-        private int _width;
-        private int _height;
-        private CameraPixelFormat _format;
-        private int _bpp;
-        private long _lastEmitTick;
-
-        public void Reset()
-        {
-            _pixels = [];
-            _width = 0;
-            _height = 0;
-            _bpp = 0;
-            _lastEmitTick = 0;
-        }
-
-        public CameraFrame? Add(FrameData? data, out string skipReason)
-        {
-            skipReason = string.Empty;
-            if (data?.PixelData is null)
-            {
-                skipReason = "PixelData is null";
-                return null;
-            }
-
-            var raw = data.PixelData.RawData.ToByteArray();
-            if (raw.Length == 0)
-            {
-                skipReason = "RawData is empty";
-                return null;
-            }
-
-            var format = data.PixelData.PixelType switch
-            {
-                PixelType.Gray8 => CameraPixelFormat.Gray8,
-                PixelType.Gray16 => CameraPixelFormat.Gray16,
-                PixelType.Bgr24 => CameraPixelFormat.Bgr24,
-                PixelType.Bgr48 => CameraPixelFormat.Bgr48,
-                _ => InferFormat(raw.Length, data),
-            };
-            var bpp = BytesPerPixel(format);
-            if (bpp <= 0)
-            {
-                skipReason = $"Unsupported pixel type {data.PixelData.PixelType}";
-                return null;
-            }
-
-            var tileW = data.PixelData.Size?.Width ?? 0;
-            var tileH = data.PixelData.Size?.Height ?? 0;
-            var fullW = data.FrameSize?.Width ?? 0;
-            var fullH = data.FrameSize?.Height ?? 0;
-            if (tileW <= 0) tileW = fullW;
-            if (tileH <= 0) tileH = fullH;
-            if (fullW <= 0) fullW = tileW;
-            if (fullH <= 0) fullH = tileH;
-            if (tileW <= 0 || tileH <= 0 || fullW <= 0 || fullH <= 0)
-            {
-                skipReason = "Width/Height missing on frame";
-                return null;
-            }
-
-            var expected = checked(tileW * tileH * bpp);
-            if (raw.Length < expected)
-            {
-                skipReason = $"Got {raw.Length} bytes, expected >= {expected} for {tileW}x{tileH} {format}";
-                return null;
-            }
-
-            var startX = data.PixelData.StartPosition?.X ?? 0;
-            var startY = data.PixelData.StartPosition?.Y ?? 0;
-            if (data.PixelData.StartPosition is null && (tileW < fullW || tileH < fullH))
-            {
-                startX = data.FramePosition?.X ?? 0;
-                startY = data.FramePosition?.Y ?? 0;
-            }
-
-            if (startX == 0 && startY == 0 && tileW == fullW && tileH == fullH)
-            {
-                Reset();
-                return new CameraFrame
-                {
-                    RawPixels = raw,
-                    Width = fullW,
-                    Height = fullH,
-                    PixelFormat = format,
-                    CapturedAt = DateTimeOffset.UtcNow,
-                };
-            }
-
-            EnsureCanvas(fullW, fullH, format, bpp);
-            Blit(raw, startX, startY, tileW, tileH);
-
-            var now = Environment.TickCount64;
-            var completed = startY + tileH >= _height && startX + tileW >= _width;
-            if (!completed && now - _lastEmitTick < 120)
-            {
-                skipReason = "buffering scan lines";
-                return null;
-            }
-
-            _lastEmitTick = now;
-            return new CameraFrame
-            {
-                RawPixels = (byte[])_pixels.Clone(),
-                Width = _width,
-                Height = _height,
-                PixelFormat = _format,
-                CapturedAt = DateTimeOffset.UtcNow,
-            };
-        }
-
-        private void EnsureCanvas(int width, int height, CameraPixelFormat format, int bpp)
-        {
-            if (_width == width && _height == height && _format == format && _pixels.Length == width * height * bpp)
-                return;
-
-            _width = width;
-            _height = height;
-            _format = format;
-            _bpp = bpp;
-            _pixels = new byte[checked(width * height * bpp)];
-            _lastEmitTick = 0;
-        }
-
-        private void Blit(byte[] src, int startX, int startY, int tileW, int tileH)
-        {
-            var srcStride = tileW * _bpp;
-            var dstStride = _width * _bpp;
-            for (var row = 0; row < tileH; row++)
-            {
-                var dy = startY + row;
-                if (dy < 0 || dy >= _height) continue;
-                var dx = Math.Max(0, startX);
-                var srcOffset = (row * srcStride) + ((dx - startX) * _bpp);
-                var copy = Math.Min(srcStride - ((dx - startX) * _bpp), (_width - dx) * _bpp);
-                if (copy <= 0 || srcOffset < 0 || srcOffset + copy > src.Length) continue;
-                Buffer.BlockCopy(src, srcOffset, _pixels, (dy * dstStride) + (dx * _bpp), copy);
-            }
-        }
-
-        private static CameraPixelFormat InferFormat(int byteLength, FrameData data)
-        {
-            var width = data.PixelData?.Size?.Width > 0 ? data.PixelData.Size.Width : data.FrameSize?.Width ?? 0;
-            var height = data.PixelData?.Size?.Height > 0 ? data.PixelData.Size.Height : data.FrameSize?.Height ?? 0;
-            if (width <= 0 || height <= 0) return CameraPixelFormat.Gray8;
-
-            var pixels = width * height;
-            if (byteLength >= pixels * 6) return CameraPixelFormat.Bgr48;
-            if (byteLength >= pixels * 3) return CameraPixelFormat.Bgr24;
-            if (byteLength >= pixels * 2) return CameraPixelFormat.Gray16;
-            return CameraPixelFormat.Gray8;
-        }
-
-        private static int BytesPerPixel(CameraPixelFormat format) => format switch
-        {
-            CameraPixelFormat.Gray8 => 1,
-            CameraPixelFormat.Gray16 => 2,
-            CameraPixelFormat.Bgr24 => 3,
-            CameraPixelFormat.Bgr48 => 6,
-            _ => 0,
-        };
     }
 }
