@@ -11,7 +11,7 @@ namespace Ttu.FiberImgApp.Infrastructure.Tests;
 public sealed class SessionExportServiceTests
 {
     [Fact]
-    public async Task SaveSessionAsync_UsesUniqueFolderPerSessionId()
+    public async Task SaveSessionAsync_AppendsNumericSuffixOnCollision()
     {
         var root = Path.Combine(Path.GetTempPath(), "fiberimg-export-tests", Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(root);
@@ -23,8 +23,8 @@ public sealed class SessionExportServiceTests
             var sut = new SessionExportService(options, settings, NullLogger<SessionExportService>.Instance);
 
             var started = DateTimeOffset.Parse("2026-09-15T14:30:00-05:00");
-            var sessionA = MakeSession(started, Guid.Parse("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"));
-            var sessionB = MakeSession(started, Guid.Parse("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"));
+            var sessionA = MakeSession(started, Guid.NewGuid());
+            var sessionB = MakeSession(started, Guid.NewGuid());
 
             var pathA = await sut.SaveSessionAsync(sessionA);
             var pathB = await sut.SaveSessionAsync(sessionB);
@@ -34,8 +34,82 @@ public sealed class SessionExportServiceTests
             Assert.True(Directory.Exists(pathB));
             Assert.True(File.Exists(Path.Combine(pathA, "session.json")));
             Assert.True(File.Exists(Path.Combine(pathB, "session.json")));
-            Assert.Contains("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", pathA, StringComparison.OrdinalIgnoreCase);
-            Assert.Contains("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", pathB, StringComparison.OrdinalIgnoreCase);
+            Assert.Equal(Path.GetFileName(pathA) + "_2", Path.GetFileName(pathB));
+        }
+        finally
+        {
+            if (Directory.Exists(root))
+                Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task SaveSessionAsync_SanitizesInvalidCharactersInCustomName()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "fiberimg-export-tests", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+
+        try
+        {
+            var settings = new AppSettingsState { SessionsRootPath = root };
+            var sut = new SessionExportService(Options.Create(new CaptureOptions()), settings, NullLogger<SessionExportService>.Instance);
+            var session = MakeSession(DateTimeOffset.Parse("2026-09-15T14:30:00-05:00"), Guid.NewGuid());
+
+            var folder = await sut.SaveSessionAsync(session, customName: "Bad:Name?");
+            var folderName = Path.GetFileName(folder);
+
+            Assert.All(Path.GetInvalidFileNameChars(), ch => Assert.DoesNotContain(ch, folderName));
+            Assert.Equal("Bad_Name", folderName);
+        }
+        finally
+        {
+            if (Directory.Exists(root))
+                Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task SaveSessionAsync_BlankCustomName_FallsBackToDefault()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "fiberimg-export-tests", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+
+        try
+        {
+            var settings = new AppSettingsState { SessionsRootPath = root };
+            var sut = new SessionExportService(Options.Create(new CaptureOptions()), settings, NullLogger<SessionExportService>.Instance);
+            var started = DateTimeOffset.Parse("2026-09-15T14:30:00-05:00");
+            var session = MakeSession(started, Guid.NewGuid());
+
+            var folder = await sut.SaveSessionAsync(session, customName: "   ");
+
+            Assert.Equal("2026-09-15_14-30-00", Path.GetFileName(folder));
+        }
+        finally
+        {
+            if (Directory.Exists(root))
+                Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task SaveSessionAsync_CustomName_CollisionGetsNumericSuffix()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "fiberimg-export-tests", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+
+        try
+        {
+            var settings = new AppSettingsState { SessionsRootPath = root };
+            var sut = new SessionExportService(Options.Create(new CaptureOptions()), settings, NullLogger<SessionExportService>.Instance);
+            var sessionA = MakeSession(DateTimeOffset.Parse("2026-09-15T14:30:00-05:00"), Guid.NewGuid());
+            var sessionB = MakeSession(DateTimeOffset.Parse("2026-09-15T15:00:00-05:00"), Guid.NewGuid());
+
+            var pathA = await sut.SaveSessionAsync(sessionA, customName: "Fiber Batch 1");
+            var pathB = await sut.SaveSessionAsync(sessionB, customName: "Fiber Batch 1");
+
+            Assert.Equal("Fiber Batch 1", Path.GetFileName(pathA));
+            Assert.Equal("Fiber Batch 1_2", Path.GetFileName(pathB));
         }
         finally
         {
@@ -69,6 +143,65 @@ public sealed class SessionExportServiceTests
         {
             if (Directory.Exists(root))
                 Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task SaveSessionAsync_CopiesBmpAlongsidePng()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "fiberimg-export-tests", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        var bmp = Path.Combine(root, "source.bmp");
+        await File.WriteAllBytesAsync(bmp, new byte[] { (byte)'B', (byte)'M', 0, 0 });
+
+        try
+        {
+            var settings = new AppSettingsState { SessionsRootPath = root };
+            var sut = new SessionExportService(Options.Create(new CaptureOptions()), settings, NullLogger<SessionExportService>.Instance);
+            var session = MakeSession(DateTimeOffset.Parse("2026-09-28T14:08:12-05:00"), Guid.NewGuid());
+            session.Images[0].BmpPath = bmp;
+
+            var folder = await sut.SaveSessionAsync(session);
+            var copied = Directory.GetFiles(folder, "*.bmp");
+            Assert.Single(copied);
+            Assert.True(File.Exists(Directory.GetFiles(folder, "*.png").Single()));
+        }
+        finally
+        {
+            if (Directory.Exists(root))
+                Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void BmpWriter_TruncatesGray16ToHighByte()
+    {
+        var path = Path.Combine(Path.GetTempPath(), "fiberimg-export-tests", Guid.NewGuid().ToString("N") + ".bmp");
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        try
+        {
+            // Two Gray16 samples: 0x03E8 (1000, high byte 0x03) and 0xFFFF (65535, high byte 0xFF).
+            var pixels = new byte[] { 0xE8, 0x03, 0xFF, 0xFF };
+            MonoBmpWriter.Write(path, new CameraFrame
+            {
+                RawPixels = pixels,
+                Width = 2,
+                Height = 1,
+                PixelFormat = CameraPixelFormat.Gray16,
+            });
+
+            var written = File.ReadAllBytes(path);
+            Assert.Equal((byte)'B', written[0]);
+            Assert.Equal((byte)'M', written[1]);
+
+            var pixelDataOffset = BinaryPrimitives.ReadUInt32LittleEndian(written.AsSpan(10));
+            Assert.Equal(3, written[(int)pixelDataOffset]);
+            Assert.Equal(255, written[(int)pixelDataOffset + 1]);
+        }
+        finally
+        {
+            if (File.Exists(path))
+                File.Delete(path);
         }
     }
 

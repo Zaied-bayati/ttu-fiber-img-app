@@ -10,6 +10,12 @@
     <ScrollViewer Padding="20">
         <StackPanel Spacing="20" MaxWidth="720">
             <TextBlock Text="Settings" Style="{StaticResource TitleTextBlockStyle}" />
+            <InfoBar
+                IsOpen="{x:Bind ViewModel.RestartRequired, Mode=OneWay}"
+                Severity="Informational"
+                Title="Restart required"
+                Message="Restart the app for ZEN / stage connection changes to take effect."
+                IsClosable="True" />
             <TextBlock Text="{x:Bind ViewModel.Message, Mode=OneWay}" TextWrapping="WrapWholeWords" Foreground="DarkOrange" />
             <TextBlock Text="{x:Bind ViewModel.StageStatus, Mode=OneWay}" TextWrapping="WrapWholeWords" Opacity="0.85" />
             <TextBlock Text="{x:Bind ViewModel.CameraStatus, Mode=OneWay}" TextWrapping="WrapWholeWords" Opacity="0.85" />
@@ -21,7 +27,7 @@
             <TextBlock Opacity="0.75" TextWrapping="WrapWholeWords"
                        Text="Use the port shown on the ZEN API Gateway tray icon (default 5002). Do not use ZEN Client/Service ports such as 5024/5025. The app also tries 5002, 50051, and 5000 if the saved port does not answer. Turn off the ZEN simulator and restart after that change. In ZEN Blue, enable Tools → Options → ZEN API → Unsupervised API Mode so this app can start Live." />
             <TextBox Header="Experiment name (no .czexp)" Text="{x:Bind ViewModel.ZenExperimentName, Mode=TwoWay}" />
-            <PasswordBox x:Name="ZenTokenBox" Header="API control token" PasswordChanged="ZenTokenBox_PasswordChanged" />
+            <PasswordBox x:Name="ZenTokenBox" Header="API control token" PasswordRevealMode="Peek" PasswordChanged="ZenTokenBox_PasswordChanged" />
             <TextBox Header="Gateway certificate path (optional .pem/.crt)" Text="{x:Bind ViewModel.ZenCertificatePath, Mode=TwoWay}" TextWrapping="Wrap" />
             <ToggleSwitch Header="Allow untrusted certificate (lab only)" IsOn="{x:Bind ViewModel.ZenAllowUntrustedCertificate, Mode=TwoWay}" />
             <StackPanel Orientation="Horizontal" Spacing="8">

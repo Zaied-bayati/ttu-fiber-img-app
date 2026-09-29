@@ -1,3 +1,4 @@
+using System.Text;
 using System.Text.Json;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -23,7 +24,7 @@ public sealed class SessionExportService : ISessionExportService
         _logger = logger;
     }
 
-    public async Task<string> SaveSessionAsync(SamplingSession session, CancellationToken cancellationToken = default)
+    public async Task<string> SaveSessionAsync(SamplingSession session, string? customName = null, CancellationToken cancellationToken = default)
     {
         var root = !string.IsNullOrWhiteSpace(_settings.SessionsRootPath)
             ? _settings.SessionsRootPath
@@ -33,14 +34,11 @@ public sealed class SessionExportService : ISessionExportService
 
         Directory.CreateDirectory(root);
 
-        // Include session Id so two saves in the same clock second cannot overwrite each other.
-        var folderName = $"{session.StartedAt.ToLocalTime():yyyy-MM-dd_HH-mm-ss}_{session.Id:N}";
+        var defaultName = session.StartedAt.ToLocalTime().ToString("yyyy-MM-dd_HH-mm-ss");
+        var sanitized = SanitizeFolderName(customName);
+        var folderBaseName = sanitized.Length == 0 ? defaultName : sanitized;
+        var folderName = UniqueDirectoryName(root, folderBaseName);
         var sessionDir = Path.Combine(root, folderName);
-        if (Directory.Exists(sessionDir))
-        {
-            throw new IOException($"Session folder already exists: {sessionDir}");
-        }
-
         Directory.CreateDirectory(sessionDir);
 
         var kept = session.Images.Where(i => i.Keep).OrderBy(i => i.Index).ToList();
@@ -61,6 +59,7 @@ public sealed class SessionExportService : ISessionExportService
 
             var cziName = CopyIfPresent(sessionDir, baseName, ".czi", image.CziPath);
             var tiffName = CopyIfPresent(sessionDir, baseName, ".tif", image.TiffPath);
+            var bmpName = CopyIfPresent(sessionDir, baseName, ".bmp", image.BmpPath);
 
             metadata.Add(new
             {
@@ -73,6 +72,7 @@ public sealed class SessionExportService : ISessionExportService
                 FileName = fileName,
                 CziFileName = cziName,
                 TiffFileName = tiffName,
+                BmpFileName = bmpName,
                 SourceCzi = image.CziPath
             });
         }
@@ -118,6 +118,40 @@ public sealed class SessionExportService : ISessionExportService
         {
             candidate = $"{baseName}_{suffix}{extension}";
             path = Path.Combine(directory, candidate);
+            suffix++;
+        }
+
+        return candidate;
+    }
+
+    private static string SanitizeFolderName(string? name)
+    {
+        if (string.IsNullOrWhiteSpace(name))
+            return string.Empty;
+
+        var trimmed = name.Trim();
+        var invalid = Path.GetInvalidFileNameChars();
+        var sb = new StringBuilder(trimmed.Length);
+        foreach (var ch in trimmed)
+            sb.Append(Array.IndexOf(invalid, ch) >= 0 ? '_' : ch);
+
+        var cleaned = sb.ToString().Trim().Trim('_');
+        const int maxLength = 80;
+        if (cleaned.Length > maxLength)
+            cleaned = cleaned[..maxLength].TrimEnd();
+
+        return cleaned;
+    }
+
+    private static string UniqueDirectoryName(string root, string baseName)
+    {
+        var candidate = baseName;
+        var path = Path.Combine(root, candidate);
+        var suffix = 2;
+        while (Directory.Exists(path))
+        {
+            candidate = $"{baseName}_{suffix}";
+            path = Path.Combine(root, candidate);
             suffix++;
         }
 

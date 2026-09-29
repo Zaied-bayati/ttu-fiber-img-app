@@ -236,7 +236,10 @@ public partial class CaptureViewModel : ObservableObject
             if (PreviewImage is null)
             {
                 for (var i = 0; i < 20 && PreviewImage is null; i++)
+                {
                     await Task.Delay(100);
+                    CameraStatus = _camera.Status; // keep the status text live during the wait, not just after
+                }
 
                 if (PreviewImage is null)
                 {
@@ -493,8 +496,10 @@ public partial class CaptureViewModel : ObservableObject
         ReviewImages.Remove(item);
     }
 
-    [RelayCommand]
-    private async Task SaveSessionAsync()
+    public string BuildDefaultSessionName() =>
+        (CurrentSession?.StartedAt ?? DateTimeOffset.Now).ToLocalTime().ToString("yyyy-MM-dd_HH-mm-ss");
+
+    public async Task SaveSessionWithNameAsync(string? customName)
     {
         if (CurrentSession is null)
         {
@@ -512,7 +517,7 @@ public partial class CaptureViewModel : ObservableObject
             foreach (var image in CurrentSession.Images)
                 image.Keep = keptIds.Contains(image.Id);
 
-            var folder = await _export.SaveSessionAsync(CurrentSession);
+            var folder = await _export.SaveSessionAsync(CurrentSession, customName);
             BannerMessage = $"Saved to: {folder}";
             ProgressMessage = "Session saved.";
             Trace(BannerMessage);
@@ -662,7 +667,9 @@ public sealed partial class ReviewImageItem : ObservableObject
     {
         Model = model;
         Thumbnail = thumbnail;
-        Caption = $"#{model.Index}  @ {model.PositionMm:0.###} mm";
+        Caption = string.IsNullOrEmpty(model.PlaceholderReason)
+            ? $"#{model.Index}  @ {model.PositionMm:0.###} mm"
+            : $"#{model.Index}  @ {model.PositionMm:0.###} mm — no preview ({model.PlaceholderReason})";
     }
 
     public CapturedImage Model { get; }

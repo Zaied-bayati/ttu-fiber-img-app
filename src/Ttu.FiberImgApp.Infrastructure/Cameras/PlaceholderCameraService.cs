@@ -38,7 +38,6 @@ public sealed class PlaceholderCameraService : ICameraService
 
     public bool IsConnected { get { lock (_gate) return _connected; } }
     public bool IsLive { get { lock (_gate) return _live; } }
-    public bool IsPreviewAvailable => true;
 
     public event EventHandler<CameraFrameEventArgs>? FrameReceived;
 
@@ -99,6 +98,41 @@ public sealed class PlaceholderCameraService : ICameraService
         var frame = CreateFrame();
         lock (_gate) _lastFrame = frame;
         return Task.FromResult(MonoFrameEncoder.ToPng(frame));
+    }
+
+    public Task<CameraCapture> CaptureAcquisitionAsync(CancellationToken cancellationToken = default)
+    {
+        // Exercises the same CameraCapture shape a real ZEN snap produces (including a BMP companion)
+        // so that path is testable without real hardware.
+        var frame = CreateFrame();
+        lock (_gate) _lastFrame = frame;
+        var png = MonoFrameEncoder.ToPng(frame);
+        var bmpPath = TryWriteSimulatorBmp(frame);
+        return Task.FromResult(new CameraCapture
+        {
+            PreviewPng = png,
+            Width = frame.Width,
+            Height = frame.Height,
+            PixelFormat = frame.PixelFormat.ToString(),
+            BmpPath = bmpPath,
+        });
+    }
+
+    private static string? TryWriteSimulatorBmp(CameraFrame frame)
+    {
+        try
+        {
+            var dir = Path.Combine(Path.GetTempPath(), "TtuFiberImgApp-Simulator");
+            Directory.CreateDirectory(dir);
+            var path = Path.Combine(dir, $"sim_{DateTime.Now:yyyyMMdd_HHmmss_fff}_{Guid.NewGuid():N}.bmp");
+            MonoBmpWriter.Write(path, frame);
+            return path;
+        }
+        catch
+        {
+            // Best-effort; never break the simulator capture path over a diagnostic file.
+            return null;
+        }
     }
 
     public Task<byte[]> GetPreviewFrameAsync(CancellationToken cancellationToken = default)

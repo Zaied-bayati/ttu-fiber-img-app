@@ -42,6 +42,28 @@ public sealed partial class CapturePage : Page
         await ViewModel.LoadPreviewCommand.ExecuteAsync(null);
     }
 
+    private async void SaveSessionButton_Click(object sender, RoutedEventArgs e)
+    {
+        var defaultName = ViewModel.BuildDefaultSessionName();
+        var nameBox = new TextBox { Header = "Session folder name", Text = defaultName };
+        var dialog = new ContentDialog
+        {
+            XamlRoot = XamlRoot,
+            Title = "Save session",
+            PrimaryButtonText = "Save",
+            CloseButtonText = "Cancel",
+            DefaultButton = ContentDialogButton.Primary,
+            Content = nameBox,
+        };
+        dialog.Opened += (_, _) => nameBox.SelectAll();
+
+        var result = await dialog.ShowAsync();
+        if (result != ContentDialogResult.Primary)
+            return;
+
+        await ViewModel.SaveSessionWithNameAsync(nameBox.Text);
+    }
+
     private void DeleteImage_Click(object sender, RoutedEventArgs e)
     {
         if (sender is Button { Tag: ReviewImageItem item })

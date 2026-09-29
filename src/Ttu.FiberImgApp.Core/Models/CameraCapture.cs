@@ -8,8 +8,12 @@ public sealed class CameraCapture
     public required byte[] PreviewPng { get; init; }
     public string? CziPath { get; init; }
     public string? TiffPath { get; init; }
+    public string? BmpPath { get; init; }
     public int Width { get; init; }
     public int Height { get; init; }
     public string? PixelFormat { get; init; }
     public int? Channel { get; init; }
+
+    /// <summary>Null when this capture has a real frame. Otherwise, why PreviewPng is a placeholder image.</summary>
+    public string? PlaceholderReason { get; init; }
 }

@@ -56,7 +56,6 @@ public sealed class ZenApiCameraService : ICameraService, IZenClient, IAsyncDisp
     public string Status { get { lock (_gate) return _status; } }
     public bool IsConnected { get { lock (_gate) return _connected; } }
     public bool IsLive { get { lock (_gate) return _live; } }
-    public bool IsPreviewAvailable => true;
 
     public event EventHandler<CameraFrameEventArgs>? FrameReceived;
 
@@ -355,9 +354,10 @@ public sealed class ZenApiCameraService : ICameraService, IZenClient, IAsyncDisp
         using var listenCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         var ready = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         int? capturedChannel = null;
+        string? lastSnapSkip = null;
         var frameTask = streaming is null
             ? Task.FromResult<CameraFrame?>(null)
-            : ListenForSnapFrameAsync(streaming, metadata, experimentId, ready, value => capturedChannel = value, listenCts.Token);
+            : ListenForSnapFrameAsync(streaming, metadata, experimentId, ready, value => capturedChannel = value, reason => lastSnapSkip = reason, listenCts.Token);
 
         try
         {
@@ -427,16 +427,22 @@ public sealed class ZenApiCameraService : ICameraService, IZenClient, IAsyncDisp
             }
 
             string? tiffPath = null;
+            string? bmpPath = null;
+            string? placeholderReason = null;
             byte[] preview;
             if (frame is null)
             {
                 preview = PlaceholderPreview();
-                SetStatus($"ZEN snap saved {cziPath}. No preview frame was received.");
+                placeholderReason = string.IsNullOrEmpty(lastSnapSkip)
+                    ? "no pixel messages arrived from ZEN before the 5s preview timeout"
+                    : lastSnapSkip;
+                SetStatus($"ZEN snap saved {cziPath}. No preview frame was received ({placeholderReason}).");
             }
             else
             {
                 preview = MonoFrameEncoder.ToPng(frame);
                 tiffPath = TryWriteTiff(outputDirectory, writtenName, frame);
+                bmpPath = TryWriteBmp(outputDirectory, writtenName, frame);
                 SetStatus(
                     $"Capture received: experiment {experimentId}, {frame.Width}x{frame.Height} {frame.PixelFormat}, " +
                     $"channel {capturedChannel?.ToString() ?? "n/a"}, raw {frame.RawPixels.Length} bytes, CZI {cziPath}");
@@ -460,10 +466,12 @@ public sealed class ZenApiCameraService : ICameraService, IZenClient, IAsyncDisp
                 PreviewPng = preview,
                 CziPath = cziPath,
                 TiffPath = tiffPath,
+                BmpPath = bmpPath,
                 Width = frame?.Width ?? 0,
                 Height = frame?.Height ?? 0,
                 PixelFormat = frame?.PixelFormat.ToString(),
                 Channel = capturedChannel,
+                PlaceholderReason = placeholderReason,
             };
         }
         finally
@@ -513,6 +521,7 @@ public sealed class ZenApiCameraService : ICameraService, IZenClient, IAsyncDisp
         string experimentId,
         TaskCompletionSource ready,
         Action<int?> reportChannel,
+        Action<string> reportSkip,
         CancellationToken token)
     {
         try
@@ -532,9 +541,16 @@ public sealed class ZenApiCameraService : ICameraService, IZenClient, IAsyncDisp
             await foreach (var response in call.ResponseStream.ReadAllAsync(token).ConfigureAwait(false))
             {
                 reportChannel(response.FrameData?.FramePosition?.C);
-                var frame = _decoder.Add(response.FrameData, enableRawData: false, out _);
+                var frame = _decoder.Add(response.FrameData, enableRawData: false, out var skip);
+                if (!string.IsNullOrEmpty(skip))
+                    reportSkip(skip);
+
                 if (frame is not null)
+                {
+                    if (!string.IsNullOrEmpty(skip))
+                        _activityLog.Write("zen", $"Pixel-format warning on snap: {skip}");
                     return frame;
+                }
             }
 
             return null;
@@ -575,6 +591,30 @@ public sealed class ZenApiCameraService : ICameraService, IZenClient, IAsyncDisp
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "Could not write TIFF {Path}", path);
+            return null;
+        }
+    }
+
+    private string? TryWriteBmp(string directory, string outputName, CameraFrame frame)
+    {
+        if (frame.PixelFormat is not (CameraPixelFormat.Gray8 or CameraPixelFormat.Gray16))
+        {
+            _logger.LogInformation("Skipping BMP for {Format}; the ZEN CZI remains the master file", frame.PixelFormat);
+            return null;
+        }
+
+        var path = Path.Combine(directory, outputName + ".bmp");
+        if (File.Exists(path))
+            path = Path.Combine(directory, outputName + "_" + Guid.NewGuid().ToString("N")[..8] + ".bmp");
+
+        try
+        {
+            MonoBmpWriter.Write(path, frame);
+            return path;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Could not write BMP {Path}", path);
             return null;
         }
     }
@@ -957,8 +997,14 @@ public sealed class ZenApiCameraService : ICameraService, IZenClient, IAsyncDisp
         }
 
         lock (_gate) _lastFrame = frame;
+        var frameMessage = $"ZEN live frame from {sourceName} ({frame.Width}x{frame.Height} {frame.PixelFormat})";
+        if (!string.IsNullOrEmpty(skipReason))
+            frameMessage += $" — {skipReason}";
+
         if (first.TrySetResult(MonitorHit.Frame))
-            SetStatus($"ZEN live frame from {sourceName} ({frame.Width}x{frame.Height} {frame.PixelFormat})");
+            SetStatus(frameMessage);
+        else if (!string.IsNullOrEmpty(skipReason) && count is 1 or 10 or 50)
+            SetStatus($"ZEN pixel-format warning: {skipReason}");
 
         try
         {

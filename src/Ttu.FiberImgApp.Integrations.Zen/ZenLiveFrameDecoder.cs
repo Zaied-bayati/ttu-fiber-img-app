@@ -52,21 +52,23 @@ internal sealed class ZenLiveFrameDecoder
         if (!enableRawData)
         {
             // zenapi_streaming.py reshapes complete frames with frame_size, not the partial tile.
-            if (TryTakeComplete(raw, data.PixelData.PixelType, fullW, fullH, out var fullFrame))
+            if (TryTakeComplete(raw, data.PixelData.PixelType, fullW, fullH, out var fullFrame, out var fullDiag))
             {
                 Reset();
+                if (!string.IsNullOrEmpty(fullDiag)) skipReason = fullDiag;
                 return fullFrame;
             }
 
-            if (TryTakeComplete(raw, data.PixelData.PixelType, tileW, tileH, out var tileFrame)
+            if (TryTakeComplete(raw, data.PixelData.PixelType, tileW, tileH, out var tileFrame, out var tileDiag)
                 && (fullW <= 0 || fullH <= 0 || (tileW == fullW && tileH == fullH)))
             {
                 Reset();
+                if (!string.IsNullOrEmpty(tileDiag)) skipReason = tileDiag;
                 return tileFrame;
             }
         }
 
-        if (!TryResolveFormat(data.PixelData.PixelType, raw.Length, fullW, fullH, tileW, tileH, out var format, out var bpp))
+        if (!TryResolveFormat(data.PixelData.PixelType, raw.Length, fullW, fullH, tileW, tileH, out var format, out var bpp, out var resolveDiag))
         {
             skipReason = $"Unsupported pixel type {data.PixelData.PixelType}";
             return null;
@@ -106,6 +108,7 @@ internal sealed class ZenLiveFrameDecoder
         if (startX == 0 && startY == 0 && tileW == fullW && tileH == fullH)
         {
             Reset();
+            if (!string.IsNullOrEmpty(resolveDiag)) skipReason = resolveDiag;
             return CreateFrame(raw, fullW, fullH, format);
         }
 
@@ -121,6 +124,7 @@ internal sealed class ZenLiveFrameDecoder
         }
 
         _lastEmitTick = now;
+        if (!string.IsNullOrEmpty(resolveDiag)) skipReason = resolveDiag;
         return CreateFrame((byte[])_pixels.Clone(), _width, _height, _format);
     }
 
@@ -129,10 +133,11 @@ internal sealed class ZenLiveFrameDecoder
         PixelType pixelType,
         int width,
         int height,
-        out CameraFrame? frame)
+        out CameraFrame? frame,
+        out string diagnostic)
     {
         frame = null;
-        if (!TryFormatForSize(pixelType, width, height, raw.Length, out var format, out _))
+        if (!TryFormatForSize(pixelType, width, height, raw.Length, out var format, out _, out diagnostic))
             return false;
 
         frame = CreateFrame(raw, width, height, format);
@@ -163,18 +168,12 @@ internal sealed class ZenLiveFrameDecoder
         int tileW,
         int tileH,
         out CameraPixelFormat format,
-        out int bpp)
+        out int bpp,
+        out string diagnostic)
     {
-        if (pixelType is PixelType.Gray8 or PixelType.Gray16 or PixelType.Bgr24 or PixelType.Bgr48)
-        {
-            format = Map(pixelType);
-            bpp = BytesPerPixel(format);
-            return bpp > 0;
-        }
-
         var width = tileW > 0 ? tileW : fullW;
         var height = tileH > 0 ? tileH : fullH;
-        if (TryFormatForSize(pixelType, width, height, byteLength, out format, out bpp))
+        if (TryFormatForSize(pixelType, width, height, byteLength, out format, out bpp, out diagnostic))
             return true;
 
         format = InferFormat(byteLength, width, height);
@@ -182,19 +181,33 @@ internal sealed class ZenLiveFrameDecoder
         return bpp > 0;
     }
 
+    /// <summary>
+    /// Resolves the pixel format for a buffer of the given size. When ZEN's declared
+    /// <paramref name="pixelType"/> is one this app recognizes, it's tried first - but if the buffer
+    /// doesn't actually match that format's expected byte length, this still falls back to scanning the
+    /// other known formats by byte length rather than giving up immediately. That fallback also catches
+    /// the case where <c>pixel_type.proto</c>'s hand-transcribed enum numbering doesn't match what this
+    /// specific ZEN Gateway/Axiocam build actually sends on the wire: <paramref name="diagnostic"/> is set
+    /// (non-fatal - the frame is still decoded) whenever the byte-length match picks a format different
+    /// from the one ZEN declared, which is the strongest signal we can get without vendor proto access.
+    /// </summary>
     private static bool TryFormatForSize(
         PixelType pixelType,
         int width,
         int height,
         int byteLength,
         out CameraPixelFormat format,
-        out int bpp)
+        out int bpp,
+        out string diagnostic)
     {
-        if (pixelType is PixelType.Gray8 or PixelType.Gray16 or PixelType.Bgr24 or PixelType.Bgr48)
+        diagnostic = string.Empty;
+        var declared = pixelType is PixelType.Gray8 or PixelType.Gray16 or PixelType.Bgr24 or PixelType.Bgr48;
+        if (declared)
         {
             format = Map(pixelType);
             bpp = BytesPerPixel(format);
-            return BufferMatches(width, height, bpp, byteLength);
+            if (bpp > 0 && BufferMatches(width, height, bpp, byteLength))
+                return true;
         }
 
         foreach (var candidate in new[]
@@ -210,6 +223,13 @@ internal sealed class ZenLiveFrameDecoder
                 continue;
 
             format = candidate;
+            if (declared && Map(pixelType) != candidate)
+            {
+                diagnostic = $"ZEN declared PixelType={pixelType} ({(int)pixelType}) but the {width}x{height} " +
+                    $"buffer ({byteLength} bytes) matches {candidate} instead - check pixel_type.proto's enum " +
+                    "numbering against the real ZEN API.";
+            }
+
             return true;
         }
 

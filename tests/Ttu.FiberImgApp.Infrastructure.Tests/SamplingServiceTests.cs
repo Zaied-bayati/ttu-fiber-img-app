@@ -54,6 +54,18 @@ public sealed class SamplingServiceTests
         await Assert.ThrowsAsync<InvalidOperationException>(() => sut.RunAsync(3, 0, 10));
     }
 
+    [Fact]
+    public async Task RunAsync_PropagatesPlaceholderReasonOntoCapturedImage()
+    {
+        var stage = new FakeStage();
+        var camera = new FakeCamera { PlaceholderReasonToReturn = "no pixel messages arrived" };
+        var sut = new SamplingService(stage, camera, NullLogger<SamplingService>.Instance, NullActivityLog.Instance);
+
+        var session = await sut.RunAsync(2, 0, 10);
+
+        Assert.All(session.Images, image => Assert.Equal("no pixel messages arrived", image.PlaceholderReason));
+    }
+
     private sealed class NullActivityLog : IActivityLog
     {
         public static NullActivityLog Instance { get; } = new();
@@ -101,11 +113,11 @@ public sealed class SamplingServiceTests
         public int? ThrowOnCaptureIndex { get; set; }
         public int FailAfterCaptures { get; set; } = int.MaxValue;
         public Action<int>? OnCapture { get; set; }
+        public string? PlaceholderReasonToReturn { get; set; }
 
         public string Status => "fake";
         public bool IsConnected => true;
         public bool IsLive => true;
-        public bool IsPreviewAvailable => true;
         public event EventHandler<CameraFrameEventArgs>? FrameReceived;
 
         public Task<bool> ConnectAsync(CancellationToken cancellationToken = default) => Task.FromResult(true);
@@ -126,6 +138,12 @@ public sealed class SamplingServiceTests
             // Signal after a successful capture so the image is retained, then cancel hits the next loop check.
             OnCapture?.Invoke(_captures);
             return Task.FromResult(bytes);
+        }
+
+        public async Task<CameraCapture> CaptureAcquisitionAsync(CancellationToken cancellationToken = default)
+        {
+            var png = await CaptureStillAsync(cancellationToken).ConfigureAwait(false);
+            return new CameraCapture { PreviewPng = png, PlaceholderReason = PlaceholderReasonToReturn };
         }
     }
 }

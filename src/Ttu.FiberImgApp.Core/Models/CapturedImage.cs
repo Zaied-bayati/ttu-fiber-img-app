@@ -14,6 +14,12 @@ public sealed class CapturedImage
     /// <summary>Uncompressed grayscale TIFF of the original samples, when the frame was received.</summary>
     public string? TiffPath { get; set; }
 
+    /// <summary>8-bit grayscale BMP companion for AI-training pipelines, when the frame was received.</summary>
+    public string? BmpPath { get; set; }
+
+    /// <summary>Null when this image is a real frame. Otherwise, why PngBytes is a placeholder image.</summary>
+    public string? PlaceholderReason { get; set; }
+
     public int Width { get; set; }
     public int Height { get; set; }
     public string? PixelFormat { get; set; }

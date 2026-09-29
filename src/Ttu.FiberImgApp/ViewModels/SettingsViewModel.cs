@@ -103,6 +103,19 @@ public partial class SettingsViewModel : ObservableObject
     [ObservableProperty]
     public partial bool ZenAllowUntrustedCertificate { get; set; }
 
+    [ObservableProperty]
+    public partial bool RestartRequired { get; set; }
+
+    private bool _baselineZenUseSimulator;
+    private string _baselineZenHost = string.Empty;
+    private double _baselineZenPort;
+    private string _baselineZenExperimentName = string.Empty;
+    private string _baselineZenCertificatePath = string.Empty;
+    private bool _baselineZenAllowUntrustedCertificate;
+    private bool _baselineUseSimulator;
+    private string _baselineSerialNumber = string.Empty;
+    private double _baselineChannel;
+
     private void LoadFromState()
     {
         UseSimulator = _settings.UseSimulator;
@@ -125,7 +138,44 @@ public partial class SettingsViewModel : ObservableObject
         ZenApiToken = _zenOptions.ApiToken;
         ZenCertificatePath = _zenOptions.CertificatePath;
         ZenAllowUntrustedCertificate = _zenOptions.AllowUntrustedCertificate;
+
+        // The running process only picks up simulator/host/channel changes on next launch, so this
+        // snapshot represents what's actually active now, not what's merely saved to disk.
+        _baselineZenUseSimulator = ZenUseSimulator;
+        _baselineZenHost = ZenHost;
+        _baselineZenPort = ZenPort;
+        _baselineZenExperimentName = ZenExperimentName;
+        _baselineZenCertificatePath = ZenCertificatePath;
+        _baselineZenAllowUntrustedCertificate = ZenAllowUntrustedCertificate;
+        _baselineUseSimulator = UseSimulator;
+        _baselineSerialNumber = SerialNumber;
+        _baselineChannel = Channel;
+        RestartRequired = false;
     }
+
+    private void UpdateRestartRequired()
+    {
+        RestartRequired =
+            ZenUseSimulator != _baselineZenUseSimulator ||
+            ZenHost != _baselineZenHost ||
+            ZenPort != _baselineZenPort ||
+            ZenExperimentName != _baselineZenExperimentName ||
+            ZenCertificatePath != _baselineZenCertificatePath ||
+            ZenAllowUntrustedCertificate != _baselineZenAllowUntrustedCertificate ||
+            UseSimulator != _baselineUseSimulator ||
+            SerialNumber != _baselineSerialNumber ||
+            Channel != _baselineChannel;
+    }
+
+    partial void OnZenUseSimulatorChanged(bool value) => UpdateRestartRequired();
+    partial void OnZenHostChanged(string value) => UpdateRestartRequired();
+    partial void OnZenPortChanged(double value) => UpdateRestartRequired();
+    partial void OnZenExperimentNameChanged(string value) => UpdateRestartRequired();
+    partial void OnZenCertificatePathChanged(string value) => UpdateRestartRequired();
+    partial void OnZenAllowUntrustedCertificateChanged(bool value) => UpdateRestartRequired();
+    partial void OnUseSimulatorChanged(bool value) => UpdateRestartRequired();
+    partial void OnSerialNumberChanged(string value) => UpdateRestartRequired();
+    partial void OnChannelChanged(double value) => UpdateRestartRequired();
 
     private void PushToState()
     {

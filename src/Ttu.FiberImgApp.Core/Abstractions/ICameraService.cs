@@ -7,7 +7,6 @@ public interface ICameraService
     string Status { get; }
     bool IsConnected { get; }
     bool IsLive { get; }
-    bool IsPreviewAvailable { get; }
 
     event EventHandler<CameraFrameEventArgs>? FrameReceived;
 

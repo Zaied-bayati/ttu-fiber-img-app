@@ -31,7 +31,7 @@ public partial class App : Application
         {
             _host = BuildHost();
             Services = _host.Services;
-            Services.GetRequiredService<IActivityLog>().Write("shell", "App started. Open Serial monitor for step-by-step status.");
+            Services.GetRequiredService<IActivityLog>().Write("shell", "App started. Open Activity log for step-by-step status.");
 
             await using (var scope = Services.CreateAsyncScope())
             {

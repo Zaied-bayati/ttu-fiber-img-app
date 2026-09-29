@@ -85,6 +85,8 @@ public sealed class SamplingService : ISamplingService
                     PngBytes = capture.PreviewPng,
                     CziPath = capture.CziPath,
                     TiffPath = capture.TiffPath,
+                    BmpPath = capture.BmpPath,
+                    PlaceholderReason = capture.PlaceholderReason,
                     Width = capture.Width,
                     Height = capture.Height,
                     PixelFormat = capture.PixelFormat,

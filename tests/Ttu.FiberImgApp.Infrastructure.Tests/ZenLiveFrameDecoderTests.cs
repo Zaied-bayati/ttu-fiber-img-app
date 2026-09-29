@@ -39,6 +39,21 @@ public class ZenLiveFrameDecoderTests
     }
 
     [Fact]
+    public void Declared_pixel_type_mismatch_falls_back_to_size_based_format_and_warns()
+    {
+        // 8 bytes for a 2x2 frame matches Gray16 (bpp 2) exactly, not the declared Bgr24 (bpp 3, needs 12).
+        var raw = new byte[] { 0, 0, 0xE8, 0x03, 0x01, 0x00, 0xFF, 0xFF };
+        var decoder = new ZenLiveFrameDecoder();
+
+        var frame = decoder.Add(Frame(raw, PixelType.Bgr24, frameW: 2, frameH: 2), enableRawData: false, out var diagnostic);
+
+        Assert.NotNull(frame);
+        Assert.Equal(CameraPixelFormat.Gray16, frame.PixelFormat);
+        Assert.Contains("PixelType=Bgr24", diagnostic, StringComparison.Ordinal);
+        Assert.Contains("Gray16", diagnostic, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void Partial_scan_lines_stitch_into_the_full_frame()
     {
         var decoder = new ZenLiveFrameDecoder();

@@ -15,7 +15,7 @@
             <RowDefinition Height="*" />
         </Grid.RowDefinitions>
 
-        <TextBlock Text="Serial monitor" Style="{StaticResource TitleTextBlockStyle}" />
+        <TextBlock Text="Activity log" Style="{StaticResource TitleTextBlockStyle}" />
         <TextBlock
             Grid.Row="1"
             Margin="0,4,0,12"
