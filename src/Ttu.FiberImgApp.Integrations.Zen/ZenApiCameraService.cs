@@ -303,6 +303,110 @@ public sealed class ZenApiCameraService : ICameraService, IZenClient, IAsyncDisp
         if (IsConnected) SetStatus("ZEN connected - live stopped");
     }
 
+    public async Task<ZenStreamProbeResult> ProbeStreamAsync(TimeSpan listenFor, CancellationToken cancellationToken = default)
+    {
+        ExperimentService.ExperimentServiceClient experiment;
+        ExperimentStreamingService.ExperimentStreamingServiceClient streaming;
+        Metadata metadata;
+        string experimentId;
+
+        lock (_gate)
+        {
+            if (!_connected || _experiment is null || _streaming is null || _metadata is null || _experimentId is null)
+                throw new InvalidOperationException("Connect to ZEN before detecting the stream channel.");
+            experiment = _experiment;
+            streaming = _streaming;
+            metadata = _metadata;
+            experimentId = _experimentId;
+        }
+
+        await _snapLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        var startedAcquisition = false;
+        try
+        {
+            if (IsLive)
+                await StopLiveAsync(cancellationToken).ConfigureAwait(false);
+            await TryStopExperimentAsync(experiment, metadata, experimentId, cancellationToken).ConfigureAwait(false);
+
+            var collector = new ZenStreamProbeCollector();
+            SetStatus("ZEN probing the pixel stream (no channel filter)...");
+
+            try
+            {
+                if (await TryStartAcquisitionAsync(experiment, metadata, experimentId, live: true, cancellationToken).ConfigureAwait(false))
+                    startedAcquisition = true;
+                else
+                    collector.AddNote("ZEN refused StartLive (Unsupervised API Mode is off), so only a Live already running in the ZEN window could be heard.");
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                collector.AddNote($"StartLive failed: {ex.Message}");
+            }
+
+            using var window = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            window.CancelAfter(listenFor);
+
+            using var thisExperiment = streaming.MonitorExperiment(
+                new ExperimentStreamingServiceMonitorExperimentRequest { ExperimentId = experimentId, EnableRawData = false },
+                headers: metadata,
+                cancellationToken: window.Token);
+            using var allExperiments = streaming.MonitorAllExperiments(
+                new ExperimentStreamingServiceMonitorAllExperimentsRequest { EnableRawData = false },
+                headers: metadata,
+                cancellationToken: window.Token);
+
+            await Task.WhenAll(
+                ProbeReadAsync("MonitorExperiment", thisExperiment.ResponseStream, r => r.FrameData, collector, window.Token),
+                ProbeReadAsync("MonitorAllExperiments", allExperiments.ResponseStream, r => r.FrameData, collector, window.Token))
+                .ConfigureAwait(false);
+
+            cancellationToken.ThrowIfCancellationRequested();
+            var result = collector.Build(listenFor);
+            SetStatus(result.PixelMessages > 0
+                ? $"ZEN probe: pixels arrive on channel(s) {string.Join(", ", result.Channels)}"
+                : "ZEN probe: no pixels arrived (see Settings for details)");
+            _activityLog.Write("zen", result.Summary);
+            return result;
+        }
+        finally
+        {
+            if (startedAcquisition)
+                await TryStopExperimentAsync(experiment, metadata, experimentId, CancellationToken.None).ConfigureAwait(false);
+            _snapLock.Release();
+        }
+    }
+
+    private async Task ProbeReadAsync<TResponse>(
+        string source,
+        IAsyncStreamReader<TResponse> reader,
+        Func<TResponse, FrameData?> frameOf,
+        ZenStreamProbeCollector collector,
+        CancellationToken token)
+    {
+        try
+        {
+            await foreach (var response in reader.ReadAllAsync(token).ConfigureAwait(false))
+                collector.Add(source, frameOf(response));
+        }
+        catch (OperationCanceledException)
+        {
+            // The listen window ended.
+        }
+        catch (RpcException ex) when (ex.StatusCode == StatusCode.Cancelled)
+        {
+            // The listen window ended.
+        }
+        catch (RpcException ex) when (ex.StatusCode == StatusCode.ResourceExhausted)
+        {
+            collector.AddNote($"{source}: a frame was larger than the gRPC receive limit.");
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "ZEN probe listener {Source} failed", source);
+            collector.AddNote($"{source}: {ex.Message}");
+        }
+    }
+
     public async Task<byte[]> CaptureStillAsync(CancellationToken cancellationToken = default)
     {
         var capture = await CaptureAcquisitionAsync(cancellationToken).ConfigureAwait(false);
@@ -530,7 +634,7 @@ public sealed class ZenApiCameraService : ICameraService, IZenClient, IAsyncDisp
                 new ExperimentStreamingServiceMonitorExperimentRequest
                 {
                     ExperimentId = experimentId,
-                    ChannelIndex = _options.ChannelIndex,
+                    ChannelIndex = _options.EffectiveChannelIndex,
                     EnableRawData = false,
                 },
                 headers: metadata,
@@ -871,7 +975,7 @@ public sealed class ZenApiCameraService : ICameraService, IZenClient, IAsyncDisp
         var sourceName = allExperiments ? "MonitorAllExperiments" : "MonitorExperiment";
         try
         {
-            var channelIndex = _options.ChannelIndex;
+            var channelIndex = _options.EffectiveChannelIndex;
             using var call = allExperiments
                 ? streaming.MonitorAllExperiments(
                     new ExperimentStreamingServiceMonitorAllExperimentsRequest
@@ -895,7 +999,7 @@ public sealed class ZenApiCameraService : ICameraService, IZenClient, IAsyncDisp
                     headers: metadata,
                     cancellationToken: token);
 
-            SetStatus($"ZEN {sourceName} stream open (complete frames {!enableRawData}, channel {channelIndex})");
+            SetStatus($"ZEN {sourceName} stream open (complete frames {!enableRawData}, channel {(channelIndex?.ToString() ?? "all")})");
 
             if (allExperiments)
             {
@@ -997,7 +1101,9 @@ public sealed class ZenApiCameraService : ICameraService, IZenClient, IAsyncDisp
         }
 
         lock (_gate) _lastFrame = frame;
-        var frameMessage = $"ZEN live frame from {sourceName} ({frame.Width}x{frame.Height} {frame.PixelFormat})";
+        var frameMessage =
+            $"ZEN live frame from {sourceName} ({frame.Width}x{frame.Height} {frame.PixelFormat}, " +
+            $"channel {data?.FramePosition?.C.ToString() ?? "n/a"})";
         if (!string.IsNullOrEmpty(skipReason))
             frameMessage += $" — {skipReason}";
 

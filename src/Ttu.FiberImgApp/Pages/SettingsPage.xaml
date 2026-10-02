@@ -26,6 +26,16 @@
             <NumberBox Header="Gateway port (ZEN API Gateway default is 5002)" Value="{x:Bind ViewModel.ZenPort, Mode=TwoWay}" Minimum="1" Maximum="65535" SpinButtonPlacementMode="Inline" />
             <TextBlock Opacity="0.75" TextWrapping="WrapWholeWords"
                        Text="Use the port shown on the ZEN API Gateway tray icon (default 5002). Do not use ZEN Client/Service ports such as 5024/5025. The app also tries 5002, 50051, and 5000 if the saved port does not answer. Turn off the ZEN simulator and restart after that change. In ZEN Blue, enable Tools → Options → ZEN API → Unsupervised API Mode so this app can start Live." />
+            <ToggleSwitch Header="Stream all channels (recommended)" IsOn="{x:Bind ViewModel.ZenStreamAllChannels, Mode=TwoWay}" />
+            <NumberBox
+                Header="Pixel stream channel (only used when Stream all channels is off)"
+                Value="{x:Bind ViewModel.ZenChannelIndex, Mode=TwoWay}"
+                IsEnabled="{x:Bind ViewModel.ZenChannelPinned, Mode=OneWay}"
+                Minimum="0"
+                Maximum="64"
+                SpinButtonPlacementMode="Inline" />
+            <TextBlock Opacity="0.75" TextWrapping="WrapWholeWords"
+                       Text="If ZEN is acquiring but no image appears, a wrong channel filter is a common cause: ZEN simply never sends a matching frame. Leave Stream all channels on, or press Detect stream channel (after Connect camera) to see which channel ZEN is really sending pixels on. Keep the image updating in ZEN while it listens. Takes effect immediately; no restart needed." />
             <TextBox Header="Experiment name (no .czexp)" Text="{x:Bind ViewModel.ZenExperimentName, Mode=TwoWay}" />
             <PasswordBox x:Name="ZenTokenBox" Header="API control token" PasswordRevealMode="Peek" PasswordChanged="ZenTokenBox_PasswordChanged" />
             <TextBox Header="Gateway certificate path (optional .pem/.crt)" Text="{x:Bind ViewModel.ZenCertificatePath, Mode=TwoWay}" TextWrapping="Wrap" />
@@ -33,7 +43,14 @@
             <StackPanel Orientation="Horizontal" Spacing="8">
                 <Button Content="Connect camera" Command="{x:Bind ViewModel.ConnectCameraCommand}" />
                 <Button Content="Disconnect camera" Command="{x:Bind ViewModel.DisconnectCameraCommand}" />
+                <Button Content="Detect stream channel" Command="{x:Bind ViewModel.DetectStreamChannelCommand}" />
             </StackPanel>
+            <TextBlock
+                Text="{x:Bind ViewModel.ZenProbeResult, Mode=OneWay}"
+                TextWrapping="WrapWholeWords"
+                IsTextSelectionEnabled="True"
+                FontFamily="Consolas"
+                FontSize="12" />
 
             <TextBlock Text="Thorlabs stage" Style="{StaticResource SubtitleTextBlockStyle}" />
             <ToggleSwitch Header="Use Thorlabs simulator (no hardware)" IsOn="{x:Bind ViewModel.UseSimulator, Mode=TwoWay}" />

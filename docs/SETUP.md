@@ -233,8 +233,9 @@ Prerequisites: **ZEN Blue or ZEN core 3.11+**, **ZEN API Gateway** (install via 
    - Set host (usually `localhost`), port (`5002`), experiment name, and the control token if you do not want the file default.
    - **Save settings**, then **restart the app** (simulator vs real client is chosen at startup).
 8. On **Capture**: Connect camera → Start live. The preview is a downscaled live image (full-resolution Axiocam frames are about 20–40 MB and are still used for saved PNGs). Double-click the preview (or Fullscreen live) for a zoomable viewer (scroll wheel / Zoom ± / Esc).
-9. Sampling stills use the **latest live frame** encoded as PNG (no CZI dependency in this version).
+9. Begin Sampling asks ZEN for one snap per position (`RunSnap`), keeps the CZI ZEN writes, and also saves a PNG, a 16-bit TIFF, and an 8-bit grayscale BMP (for AI training) when a pixel frame arrives for the preview.
 10. If live fails with a busy / conflict error, stop Live in the ZEN UI so the Gateway can start live from this app.
+11. **No image, but ZEN is acquiring?** The pixel stream is filtered by channel, and a filter that doesn't match what ZEN publishes silently produces zero frames. In **Settings → Zeiss ZEN / Axiocam**, leave **Stream all channels** on (default), or press **Detect stream channel** (after Connect camera, with the image updating in ZEN). It listens for about 10 seconds with no filter and reports every channel, frame size, and pixel type ZEN sends. To pin a channel, turn off Stream all channels and set the number it reports. The change applies immediately; no restart needed.
 
 Offline: leave **Use ZEN simulator** on — Capture shows a synthetic gray live stream for UI testing without Gateway.
 

@@ -21,13 +21,6 @@ public static class DependencyInjection
         SQLitePCL.Batteries_V2.Init();
 
         services.Configure<ZenOptions>(configuration.GetSection(ZenOptions.SectionName));
-        services.PostConfigure<ZenOptions>(options =>
-        {
-            // Saved settings copied the old default of 0 and override appsettings.json.
-            // This Axiocam publishes on channel 1.
-            if (options.ChannelIndex == 0)
-                options.ChannelIndex = 1;
-        });
         services.Configure<ThorlabsOptions>(configuration.GetSection(ThorlabsOptions.SectionName));
         services.Configure<CaptureOptions>(configuration.GetSection(CaptureOptions.SectionName));
         services.Configure<UpdatesOptions>(configuration.GetSection(UpdatesOptions.SectionName));

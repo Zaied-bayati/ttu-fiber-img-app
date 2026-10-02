@@ -12,6 +12,7 @@ public partial class SettingsViewModel : ObservableObject
 {
     private readonly IThorlabsClient _stage;
     private readonly ICameraService _camera;
+    private readonly IZenClient _zen;
     private readonly AppSettingsState _settings;
     private readonly ThorlabsOptions _thorlabsOptions;
     private readonly CaptureOptions _captureOptions;
@@ -21,6 +22,7 @@ public partial class SettingsViewModel : ObservableObject
     public SettingsViewModel(
         IThorlabsClient stage,
         ICameraService camera,
+        IZenClient zen,
         AppSettingsState settings,
         IOptions<ThorlabsOptions> thorlabsOptions,
         IOptions<CaptureOptions> captureOptions,
@@ -29,6 +31,7 @@ public partial class SettingsViewModel : ObservableObject
     {
         _stage = stage;
         _camera = camera;
+        _zen = zen;
         _settings = settings;
         _thorlabsOptions = thorlabsOptions.Value;
         _captureOptions = captureOptions.Value;
@@ -104,6 +107,19 @@ public partial class SettingsViewModel : ObservableObject
     public partial bool ZenAllowUntrustedCertificate { get; set; }
 
     [ObservableProperty]
+    public partial bool ZenStreamAllChannels { get; set; } = true;
+
+    [ObservableProperty]
+    public partial double ZenChannelIndex { get; set; } = 1;
+
+    [ObservableProperty]
+    public partial string ZenProbeResult { get; set; } = string.Empty;
+
+    public bool ZenChannelPinned => !ZenStreamAllChannels;
+
+    partial void OnZenStreamAllChannelsChanged(bool value) => OnPropertyChanged(nameof(ZenChannelPinned));
+
+    [ObservableProperty]
     public partial bool RestartRequired { get; set; }
 
     private bool _baselineZenUseSimulator;
@@ -138,6 +154,8 @@ public partial class SettingsViewModel : ObservableObject
         ZenApiToken = _zenOptions.ApiToken;
         ZenCertificatePath = _zenOptions.CertificatePath;
         ZenAllowUntrustedCertificate = _zenOptions.AllowUntrustedCertificate;
+        ZenStreamAllChannels = _zenOptions.StreamAllChannels;
+        ZenChannelIndex = _zenOptions.ChannelIndex;
 
         // The running process only picks up simulator/host/channel changes on next launch, so this
         // snapshot represents what's actually active now, not what's merely saved to disk.
@@ -197,6 +215,8 @@ public partial class SettingsViewModel : ObservableObject
         _zenOptions.ApiToken = ZenApiToken;
         _zenOptions.CertificatePath = ZenCertificatePath;
         _zenOptions.AllowUntrustedCertificate = ZenAllowUntrustedCertificate;
+        _zenOptions.StreamAllChannels = ZenStreamAllChannels;
+        _zenOptions.ChannelIndex = (int)Math.Round(ZenChannelIndex);
     }
 
     [RelayCommand]
@@ -267,6 +287,35 @@ public partial class SettingsViewModel : ObservableObject
         catch (Exception ex)
         {
             Message = ex.Message;
+        }
+        finally
+        {
+            IsBusy = false;
+            CameraStatus = _camera.Status;
+        }
+    }
+
+    [RelayCommand]
+    private async Task DetectStreamChannelAsync()
+    {
+        PushToState();
+        IsBusy = true;
+        ZenProbeResult = "Listening to the ZEN pixel stream for about 10 seconds...";
+        try
+        {
+            if (!_camera.IsConnected && !await _camera.ConnectAsync())
+            {
+                ZenProbeResult = $"Connect the camera first. {_camera.Status}";
+                return;
+            }
+
+            var result = await _zen.ProbeStreamAsync(TimeSpan.FromSeconds(10));
+            ZenProbeResult = result.Summary;
+            _log.Write("settings", "Detect stream channel finished.");
+        }
+        catch (Exception ex)
+        {
+            ZenProbeResult = $"Detect stream channel failed: {ex.Message}";
         }
         finally
         {
@@ -363,6 +412,7 @@ public partial class SettingsViewModel : ObservableObject
                 ApiToken = _zenOptions.ApiToken,
                 ExperimentName = _zenOptions.ExperimentName,
                 CertificatePath = _zenOptions.CertificatePath,
+                StreamAllChannels = _zenOptions.StreamAllChannels,
                 ChannelIndex = _zenOptions.ChannelIndex,
                 AllowUntrustedCertificate = _zenOptions.AllowUntrustedCertificate,
             },

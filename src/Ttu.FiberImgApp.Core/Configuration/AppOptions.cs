@@ -20,8 +20,18 @@ public sealed class ZenOptions
     /// <summary>Optional path to Gateway CA certificate (.pem/.crt). Empty = use system trust store.</summary>
     public string CertificatePath { get; set; } = string.Empty;
 
-    /// <summary>Channel index for the Axiocam stream. This instrument uses channel 1.</summary>
+    /// <summary>
+    /// When true (default) the pixel stream is requested without a channel filter, exactly like
+    /// zenapi_streaming.py with channel_index=None. A pinned channel that does not match what ZEN
+    /// publishes silently yields zero frames, so only pin one after Detect stream channel confirms it.
+    /// </summary>
+    public bool StreamAllChannels { get; set; } = true;
+
+    /// <summary>Channel to request when <see cref="StreamAllChannels"/> is false.</summary>
     public int ChannelIndex { get; set; } = 1;
+
+    /// <summary>The channel filter sent to ZEN, or null for no filter.</summary>
+    public int? EffectiveChannelIndex => StreamAllChannels ? null : ChannelIndex;
 
     /// <summary>When true, skip TLS certificate validation (lab debugging only).</summary>
     public bool AllowUntrustedCertificate { get; set; } = false;
