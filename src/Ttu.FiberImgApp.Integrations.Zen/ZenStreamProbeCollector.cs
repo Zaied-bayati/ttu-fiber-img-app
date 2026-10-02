@@ -43,7 +43,7 @@ internal sealed class ZenStreamProbeCollector
         lock (_gate) _notes.Add(note);
     }
 
-    public ZenStreamProbeResult Build(TimeSpan listened)
+    public ZenStreamProbeResult Build(TimeSpan listened, bool imageFileWritten = false)
     {
         lock (_gate)
         {
@@ -61,9 +61,17 @@ internal sealed class ZenStreamProbeCollector
             var seconds = listened.TotalSeconds.ToString("0", CultureInfo.InvariantCulture);
             if (_total == 0)
             {
-                text.Append($"No stream messages arrived in {seconds}s. ZEN is not sending pixels to this app at all. ")
-                    .Append("Make sure the image is updating in ZEN (Live running), Unsupervised API Mode is on ")
-                    .Append("(ZEN: Tools > Options > ZEN API), and the experiment's active camera is the Axiocam.");
+                text.Append($"No stream messages arrived in {seconds}s. ZEN is not sending pixels to this app at all. ");
+                if (imageFileWritten)
+                {
+                    text.Append("The experiment did run and ZEN saved its image, so the camera and API control work; this ZEN/Gateway ")
+                        .Append("simply does not stream this camera's pixels. Live view and previews read the saved CZI files instead.");
+                }
+                else
+                {
+                    text.Append("Make sure Unsupervised API Mode is on (ZEN: Tools > Options > ZEN API), the experiment's ")
+                        .Append("active camera is the Axiocam, and an experiment is actually running while this listens.");
+                }
             }
             else
             {

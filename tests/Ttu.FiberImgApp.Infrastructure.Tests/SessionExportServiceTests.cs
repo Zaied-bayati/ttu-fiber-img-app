@@ -205,6 +205,64 @@ public sealed class SessionExportServiceTests
         }
     }
 
+    [Theory]
+    [InlineData(12, 4095, 255)]  // 12-bit full scale uses the whole byte range
+    [InlineData(12, 1000, 62)]   // 1000 >> 4
+    [InlineData(14, 16383, 255)]
+    [InlineData(16, 65535, 255)]
+    public void BmpWriter_scales_gray16_by_the_sensor_bit_depth(int bits, int sample, int expected)
+    {
+        var path = Path.Combine(Path.GetTempPath(), "fiberimg-export-tests", Guid.NewGuid().ToString("N") + ".bmp");
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        try
+        {
+            var pixels = new byte[2];
+            BinaryPrimitives.WriteUInt16LittleEndian(pixels, (ushort)sample);
+            MonoBmpWriter.Write(path, new CameraFrame
+            {
+                RawPixels = pixels,
+                Width = 1,
+                Height = 1,
+                PixelFormat = CameraPixelFormat.Gray16,
+                SignificantBits = bits,
+            });
+
+            var written = File.ReadAllBytes(path);
+            var offset = (int)BinaryPrimitives.ReadUInt32LittleEndian(written.AsSpan(10));
+            Assert.Equal(expected, written[offset]);
+        }
+        finally
+        {
+            if (File.Exists(path))
+                File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public void BmpWriter_infers_the_depth_from_the_brightest_sample_when_the_sensor_depth_is_unknown()
+    {
+        var path = Path.Combine(Path.GetTempPath(), "fiberimg-export-tests", Guid.NewGuid().ToString("N") + ".bmp");
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        try
+        {
+            // Brightest sample 4095 needs 12 bits, so it must map to 255 rather than a near-black 15.
+            var pixels = new byte[4];
+            BinaryPrimitives.WriteUInt16LittleEndian(pixels, 4095);
+            BinaryPrimitives.WriteUInt16LittleEndian(pixels.AsSpan(2), 2048);
+            MonoBmpWriter.Write(path, new CameraFrame { RawPixels = pixels, Width = 2, Height = 1, PixelFormat = CameraPixelFormat.Gray16 });
+
+            var written = File.ReadAllBytes(path);
+            var offset = (int)BinaryPrimitives.ReadUInt32LittleEndian(written.AsSpan(10));
+            Assert.Equal(255, written[offset]);
+            Assert.Equal(128, written[offset + 1]);
+        }
+        finally
+        {
+            if (File.Exists(path))
+                File.Delete(path);
+        }
+    }
+
     [Fact]
     public void TiffWriter_PreservesGray16Samples()
     {

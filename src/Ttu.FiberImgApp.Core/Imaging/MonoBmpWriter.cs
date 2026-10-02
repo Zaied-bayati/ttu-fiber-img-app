@@ -4,10 +4,10 @@ using Ttu.FiberImgApp.Core.Models;
 namespace Ttu.FiberImgApp.Core.Imaging;
 
 /// <summary>
-/// Writes an uncompressed 8-bit indexed grayscale BMP for AI-training pipelines. Gray16 samples are
-/// truncated to their high byte - a fixed, frame-independent mapping - rather than per-frame min/max
-/// stretched, so the same physical intensity maps to the same byte value across an image set. The .tif
-/// / .czi remain the lossless masters; this is an intentionally lossy, 8-bit companion.
+/// Writes an uncompressed 8-bit indexed grayscale BMP for AI-training pipelines. Gray16 samples are scaled by
+/// the sensor's bit depth (a fixed, frame-independent mapping) rather than per-frame min/max stretched, so the
+/// same physical intensity maps to the same byte value across an image set. The .tif / .czi remain the
+/// lossless masters; this is an intentionally lossy, 8-bit companion.
 /// </summary>
 public static class MonoBmpWriter
 {
@@ -22,7 +22,7 @@ public static class MonoBmpWriter
         byte[] gray8 = frame.PixelFormat switch
         {
             CameraPixelFormat.Gray8 => frame.RawPixels,
-            CameraPixelFormat.Gray16 => TruncateGray16ToHighByte(frame.RawPixels, frame.Width * frame.Height),
+            CameraPixelFormat.Gray16 => ScaleGray16To8(frame.RawPixels, frame.Width * frame.Height, frame.SignificantBits),
             _ => throw new NotSupportedException($"BMP export does not support {frame.PixelFormat}. The CZI from ZEN keeps that data."),
         };
 
@@ -80,14 +80,35 @@ public static class MonoBmpWriter
         }
     }
 
-    private static byte[] TruncateGray16ToHighByte(byte[] src, int sampleCount)
+    /// <summary>
+    /// Drops the unused low bits: shift = bitDepth - 8. The depth comes from the sensor (CZI ComponentBitCount) so
+    /// every image from the same camera is scaled identically; only when it is unknown is it inferred from this
+    /// frame's brightest sample.
+    /// </summary>
+    private static byte[] ScaleGray16To8(byte[] src, int sampleCount, int? significantBits)
     {
-        var dst = new byte[sampleCount];
-        for (var i = 0; i < sampleCount; i++)
+        var count = Math.Min(sampleCount, src.Length / 2);
+        int bits;
+        if (significantBits is >= 8 and <= 16)
         {
-            var offset = i * 2;
-            dst[i] = offset + 1 < src.Length ? src[offset + 1] : (byte)0;
+            bits = significantBits.Value;
         }
+        else
+        {
+            ushort max = 0;
+            for (var i = 0; i < count; i++)
+            {
+                var v = BinaryPrimitives.ReadUInt16LittleEndian(src.AsSpan(i * 2));
+                if (v > max) max = v;
+            }
+
+            bits = Math.Clamp(32 - System.Numerics.BitOperations.LeadingZeroCount((uint)max), 8, 16);
+        }
+
+        var shift = bits - 8;
+        var dst = new byte[sampleCount];
+        for (var i = 0; i < count; i++)
+            dst[i] = (byte)Math.Min(255, BinaryPrimitives.ReadUInt16LittleEndian(src.AsSpan(i * 2)) >> shift);
 
         return dst;
     }

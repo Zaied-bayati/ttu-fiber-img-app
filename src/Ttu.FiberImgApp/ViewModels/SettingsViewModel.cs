@@ -300,7 +300,7 @@ public partial class SettingsViewModel : ObservableObject
     {
         PushToState();
         IsBusy = true;
-        ZenProbeResult = "Listening to the ZEN pixel stream for about 10 seconds...";
+        ZenProbeResult = "Starting the experiment like the Zeiss sample and listening to the pixel stream for about 20 seconds...";
         try
         {
             if (!_camera.IsConnected && !await _camera.ConnectAsync())
@@ -309,7 +309,7 @@ public partial class SettingsViewModel : ObservableObject
                 return;
             }
 
-            var result = await _zen.ProbeStreamAsync(TimeSpan.FromSeconds(10));
+            var result = await _zen.ProbeStreamAsync(TimeSpan.FromSeconds(20));
             ZenProbeResult = result.Summary;
             _log.Write("settings", "Detect stream channel finished.");
         }

@@ -35,7 +35,7 @@
                 Maximum="64"
                 SpinButtonPlacementMode="Inline" />
             <TextBlock Opacity="0.75" TextWrapping="WrapWholeWords"
-                       Text="If ZEN is acquiring but no image appears, a wrong channel filter is a common cause: ZEN simply never sends a matching frame. Leave Stream all channels on, or press Detect stream channel (after Connect camera) to see which channel ZEN is really sending pixels on. Keep the image updating in ZEN while it listens. Takes effect immediately; no restart needed." />
+                       Text="Live view follows Zeiss's streaming sample: the app opens ZEN's pixel stream, starts the experiment, and shows the frames. Leave Stream all channels on unless you need one channel. Detect stream channel (after Connect camera) starts the experiment, listens for about 20 seconds, and reports which channels ZEN streams. If ZEN streams nothing but still saves the image, live view and Begin Sampling previews read the saved CZI file instead. Takes effect immediately; no restart needed." />
             <TextBox Header="Experiment name (no .czexp)" Text="{x:Bind ViewModel.ZenExperimentName, Mode=TwoWay}" />
             <PasswordBox x:Name="ZenTokenBox" Header="API control token" PasswordRevealMode="Peek" PasswordChanged="ZenTokenBox_PasswordChanged" />
             <TextBox Header="Gateway certificate path (optional .pem/.crt)" Text="{x:Bind ViewModel.ZenCertificatePath, Mode=TwoWay}" TextWrapping="Wrap" />

@@ -5,6 +5,8 @@ using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using Serilog;
 using Ttu.FiberImgApp.Core.Abstractions;
+using Ttu.FiberImgApp.Core.Imaging;
+using Ttu.FiberImgApp.Imaging;
 using Ttu.FiberImgApp.Infrastructure;
 using Ttu.FiberImgApp.Integrations.Thorlabs;
 using Ttu.FiberImgApp.Integrations.Zen;
@@ -77,6 +79,7 @@ public partial class App : Application
             .ConfigureServices((context, services) =>
             {
                 services.AddInfrastructure(context.Configuration);
+                services.AddSingleton<ICziTileDecoder, JpegXrCziTileDecoder>();
                 services.AddZenIntegration();
                 services.AddThorlabsIntegration();
                 services.AddSingleton<CaptureViewModel>();

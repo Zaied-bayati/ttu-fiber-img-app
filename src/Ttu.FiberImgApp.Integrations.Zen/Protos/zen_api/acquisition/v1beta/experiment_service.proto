@@ -45,8 +45,46 @@ message ExperimentServiceRunSnapResponse {
   string output_name = 1;
 }
 
+message ExperimentServiceStartExperimentRequest {
+  string experiment_id = 1;
+  string output_name = 2;
+}
+
+message ExperimentServiceStartExperimentResponse {
+  string output_name = 1;
+}
+
+// Field numbers match zen_api.acquisition.v1beta.ExperimentStatus (field 16, total_elapsed_time, is ignored).
+message ExperimentStatus {
+  int32 tiles_index = 1;
+  int32 tiles_count = 2;
+  int32 cumulated_tiles_count = 3;
+  int32 scenes_index = 4;
+  int32 scenes_count = 5;
+  int32 time_points_index = 6;
+  int32 time_points_count = 7;
+  int32 zstack_slices_index = 8;
+  int32 zstack_slices_count = 9;
+  int32 channels_index = 10;
+  int32 channels_count = 11;
+  int32 images_acquired_index = 12;
+  int32 images_count = 13;
+  bool is_experiment_running = 14;
+  bool is_acquisition_running = 15;
+}
+
+message ExperimentServiceGetStatusRequest {
+  string experiment_id = 1;
+}
+
+message ExperimentServiceGetStatusResponse {
+  ExperimentStatus status = 1;
+}
+
 service ExperimentService {
   rpc Load(ExperimentServiceLoadRequest) returns (ExperimentServiceLoadResponse);
+  rpc StartExperiment(ExperimentServiceStartExperimentRequest) returns (ExperimentServiceStartExperimentResponse);
+  rpc GetStatus(ExperimentServiceGetStatusRequest) returns (ExperimentServiceGetStatusResponse);
   rpc GetImageOutputPath(ExperimentServiceGetImageOutputPathRequest) returns (ExperimentServiceGetImageOutputPathResponse);
   rpc RunSnap(ExperimentServiceRunSnapRequest) returns (ExperimentServiceRunSnapResponse);
   rpc StartLive(ExperimentServiceStartLiveRequest) returns (google.protobuf.Empty);
