@@ -213,6 +213,127 @@ public class CziReaderTests
         }
     }
 
+    [Fact]
+    public void First_plane_of_a_time_series_is_the_earliest_time_point()
+    {
+        byte[] t0 = [1, 1, 1, 1];
+        byte[] t1 = [2, 2, 2, 2];
+        var czi = CziFile.Build([new CziFile.Tile(0, 0, 0, 0, 2, 2, t1, Time: 1), new CziFile.Tile(0, 0, 0, 0, 2, 2, t0, Time: 0)]);
+
+        Assert.True(Read(czi, out var frame, out var error, out _), error);
+        Assert.Equal(t0, frame!.RawPixels);
+    }
+
+    [Fact]
+    public void Tail_returns_the_newest_plane_of_a_finished_time_series_and_nothing_twice()
+    {
+        byte[] t0 = [1, 1, 1, 1];
+        byte[] t1 = [2, 2, 2, 2];
+        byte[] t2 = [3, 3, 3, 3];
+        using var file = TempCzi.Write(CziFile.Build(
+        [
+            new CziFile.Tile(0, 0, 0, 0, 2, 2, t0, Time: 0),
+            new CziFile.Tile(0, 0, 0, 0, 2, 2, t1, Time: 1),
+            new CziFile.Tile(0, 0, 0, 0, 2, 2, t2, Time: 2),
+        ]));
+        var tail = new CziTail();
+
+        Assert.True(tail.TryReadNew(file.Path, null, force: false, out var first, out var error, out _), error);
+        Assert.Equal(t2, first!.RawPixels);
+
+        Assert.True(tail.TryReadNew(file.Path, null, force: true, out var again, out error, out _), error);
+        Assert.Null(again);
+    }
+
+    [Fact]
+    public void Tail_follows_a_file_that_is_still_growing_and_ignores_the_half_written_plane()
+    {
+        byte[] t0 = [1, 1, 1, 1];
+        byte[] t1 = [2, 2, 2, 2];
+        // No directory yet, as in a file ZEN has not finished: the reader has to walk the sub-blocks.
+        var oneDone = CziFile.Build([new CziFile.Tile(0, 0, 0, 0, 2, 2, t0, Time: 0)], includeDirectory: false);
+        var twoDone = CziFile.Build(
+            [new CziFile.Tile(0, 0, 0, 0, 2, 2, t0, Time: 0), new CziFile.Tile(0, 0, 0, 0, 2, 2, t1, Time: 1)],
+            includeDirectory: false);
+        var halfWritten = twoDone[..(twoDone.Length - 10)];
+
+        using var file = TempCzi.Write(oneDone);
+        var tail = new CziTail();
+
+        Assert.True(tail.TryReadNew(file.Path, null, false, out var frame, out var error, out _), error);
+        Assert.Equal(t0, frame!.RawPixels);
+
+        file.Overwrite(halfWritten);
+        Assert.True(tail.TryReadNew(file.Path, null, false, out frame, out error, out _), error);
+        Assert.Null(frame); // the second plane is not complete, so nothing new yet
+
+        file.Overwrite(twoDone);
+        Assert.True(tail.TryReadNew(file.Path, null, false, out frame, out error, out _), error);
+        Assert.Equal(t1, frame!.RawPixels);
+    }
+
+    [Fact]
+    public void Tail_does_not_reread_a_file_that_has_not_grown()
+    {
+        using var file = TempCzi.Write(CziFile.Build([new CziFile.Tile(0, 0, 0, 0, 2, 2, [1, 2, 3, 4])], includeDirectory: false));
+        var tail = new CziTail();
+        Assert.True(tail.TryReadNew(file.Path, null, false, out var frame, out var error, out _), error);
+        Assert.NotNull(frame);
+
+        // Same bytes, same length: the cheap check answers without scanning.
+        Assert.True(tail.TryReadNew(file.Path, null, false, out frame, out error, out _), error);
+        Assert.Null(frame);
+        Assert.True(tail.FileLength > 0);
+    }
+
+    [Fact]
+    public void Tail_reports_a_missing_file_as_retryable()
+    {
+        var tail = new CziTail();
+
+        var ok = tail.TryReadNew(Path.Combine(Path.GetTempPath(), "fiberimg-missing-" + Guid.NewGuid().ToString("N") + ".czi"), null, false, out var frame, out _, out var permanent);
+
+        Assert.False(ok);
+        Assert.Null(frame);
+        Assert.False(permanent);
+    }
+
+    [Fact]
+    public void Tail_reports_an_unsupported_compression_as_permanent()
+    {
+        using var file = TempCzi.Write(CziFile.Build([new CziFile.Tile(1, Compression: 4, 0, 0, 2, 2, new byte[16])]));
+        var tail = new CziTail();
+
+        var ok = tail.TryReadNew(file.Path, null, false, out _, out var error, out var permanent);
+
+        Assert.False(ok);
+        Assert.True(permanent);
+        Assert.Contains("JPEG XR", error, StringComparison.Ordinal);
+    }
+
+    private sealed class TempCzi : IDisposable
+    {
+        private TempCzi(string path) => Path = path;
+
+        public string Path { get; }
+
+        public static TempCzi Write(byte[] bytes)
+        {
+            var path = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "fiberimg-czi-tests", Guid.NewGuid().ToString("N") + ".czi");
+            Directory.CreateDirectory(System.IO.Path.GetDirectoryName(path)!);
+            File.WriteAllBytes(path, bytes);
+            return new TempCzi(path);
+        }
+
+        public void Overwrite(byte[] bytes) => File.WriteAllBytes(Path, bytes);
+
+        public void Dispose()
+        {
+            try { File.Delete(Path); }
+            catch (IOException) { }
+        }
+    }
+
     private static bool Read(byte[] czi, out CameraFrame? frame, out string error, out bool permanent)
     {
         using var stream = new MemoryStream(czi);
@@ -251,7 +372,8 @@ public class CziReaderTests
             int Height,
             byte[] Data,
             int Channel = 0,
-            byte Pyramid = 0);
+            byte Pyramid = 0,
+            int Time = 0);
 
         private const int HeaderSegmentData = 512;
 
@@ -306,7 +428,7 @@ public class CziReaderTests
 
         private static byte[] Entry(Tile tile, long filePosition)
         {
-            const int dimensions = 3; // X, Y, C
+            const int dimensions = 4; // X, Y, C, T
             var entry = new byte[32 + (dimensions * 20)];
             entry[0] = (byte)'D';
             entry[1] = (byte)'V';
@@ -318,6 +440,7 @@ public class CziReaderTests
             WriteDimension(entry, 0, 'X', tile.X, tile.Width);
             WriteDimension(entry, 1, 'Y', tile.Y, tile.Height);
             WriteDimension(entry, 2, 'C', tile.Channel, 1);
+            WriteDimension(entry, 3, 'T', tile.Time, 1);
             return entry;
         }
 

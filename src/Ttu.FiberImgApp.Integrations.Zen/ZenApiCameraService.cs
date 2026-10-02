@@ -18,9 +18,10 @@ namespace Ttu.FiberImgApp.Integrations.Zen;
 /// Live view follows Zeiss's zenapi_streaming.py / zenapi_stream2omezarr.py: ZEN only streams pixels for a
 /// running experiment, so the pixel stream (MonitorAllExperiments) is opened first and the experiment is then
 /// started with ExperimentService.StartExperiment. Frames are shown from the stream when ZEN sends them. If it
-/// stays silent, each run's saved CZI is read instead (Zeiss's own examples also read the CZI after a run), so
-/// a live image appears either way. StartLive/StartContinuous are not used: nothing in Zeiss's samples streams
-/// pixels from them.
+/// stays silent, the run's CZI is followed while ZEN writes it (Zeiss's own examples also read the CZI), showing
+/// each new plane as it lands, so a live image appears either way. A one-image experiment gives roughly one frame
+/// per ZEN run; a time-series experiment gives a steady video-like stream. StartLive/StartContinuous are not
+/// used: nothing in Zeiss's samples streams pixels from them.
 ///
 /// Stills (Begin Sampling) use RunSnap and read the CZI ZEN writes for the preview, PNG, TIFF and BMP.
 /// </summary>
@@ -28,6 +29,9 @@ public sealed class ZenApiCameraService : ICameraService, IZenClient, IAsyncDisp
 {
     private const string LivePreviewPrefix = "LivePreview_";
     private const string ProbePrefix = "StreamProbe_";
+
+    // A live run whose CZI grows past this is stopped and restarted, so a long time series cannot fill the disk.
+    private const long LiveRunMaxFileBytes = 768L * 1024 * 1024;
 
     private readonly ZenOptions _options;
     private readonly ILogger<ZenApiCameraService> _logger;
@@ -53,7 +57,12 @@ public sealed class ZenApiCameraService : ICameraService, IZenClient, IAsyncDisp
     private int _liveFrames;
     private int _streamMessages;
     private int _streamFrames;
+    private int _liveRuns;
     private string _lastSkip = string.Empty;
+    private readonly LiveRateMeter _rate = new();
+    private volatile string _liveMode = string.Empty;
+    private long _rateStatusAt;
+    private bool _rateLogged;
 
     public ZenApiCameraService(
         IOptions<ZenOptions> options,
@@ -203,9 +212,14 @@ public sealed class ZenApiCameraService : ICameraService, IZenClient, IAsyncDisp
             _frameTooLarge = false;
             _waitingForZenUi = false;
             _liveFrames = 0;
+            _liveRuns = 0;
             _streamMessages = 0;
             _streamFrames = 0;
             _lastSkip = string.Empty;
+            _liveMode = string.Empty;
+            _rateStatusAt = 0;
+            _rateLogged = false;
+            _rate.Reset();
             _decoder.Reset();
             task = Task.Run(() => LiveLoopAsync(experiment, streaming, metadata, experimentId, cts.Token), CancellationToken.None);
             _liveTask = task;
@@ -276,13 +290,15 @@ public sealed class ZenApiCameraService : ICameraService, IZenClient, IAsyncDisp
             var useSnap = false;
             var failures = 0;
             string? lastError = null;
-            string? shownMode = null;
 
             while (!token.IsCancellationRequested)
             {
                 var name = LivePreviewPrefix + DateTime.Now.ToString("yyyyMMdd_HHmmss_fff");
+                var cziPath = outputDirectory is null ? null : Path.Combine(outputDirectory, name + ".czi");
                 var streamFramesBefore = Volatile.Read(ref _streamFrames);
+                var tail = new LiveTail();
                 string? iterationError = null;
+                Interlocked.Increment(ref _liveRuns);
 
                 try
                 {
@@ -293,12 +309,26 @@ public sealed class ZenApiCameraService : ICameraService, IZenClient, IAsyncDisp
                     else
                     {
                         await StartExperimentOnceAsync(experiment, metadata, experimentId, name, token).ConfigureAwait(false);
-                        await WaitForExperimentEndAsync(
-                            experiment,
-                            metadata,
-                            experimentId,
-                            outputDirectory is null ? null : Path.Combine(outputDirectory, name + ".czi"),
-                            token).ConfigureAwait(false);
+
+                        // While ZEN runs the experiment, show each plane as soon as it is written to the CZI.
+                        // A snap-type experiment yields one plane; a time series yields a steady stream of them.
+                        Func<CancellationToken, Task>? whileRunning = cziPath is null
+                            ? null
+                            : async t =>
+                            {
+                                if (Volatile.Read(ref _streamFrames) > streamFramesBefore)
+                                    return; // the pixel stream is delivering; the file is not needed
+
+                                await TailCziAsync(tail, cziPath, force: false, t).ConfigureAwait(false);
+                                if (tail.Reader.FileLength > LiveRunMaxFileBytes && !tail.Stopped)
+                                {
+                                    // A long time series would fill the disk: end this run; the loop starts a fresh one.
+                                    tail.Stopped = true;
+                                    await TryStopExperimentAsync(experiment, metadata, experimentId, t).ConfigureAwait(false);
+                                }
+                            };
+
+                        await WaitForExperimentEndAsync(experiment, metadata, experimentId, cziPath, whileRunning, token).ConfigureAwait(false);
                     }
                 }
                 catch (RpcException ex) when (IsControllingDenied(ex))
@@ -320,36 +350,24 @@ public sealed class ZenApiCameraService : ICameraService, IZenClient, IAsyncDisp
                 }
 
                 var gotFrame = Volatile.Read(ref _streamFrames) > streamFramesBefore;
-                CameraFrame? cziFrame = null;
-                if (!gotFrame && outputDirectory is not null && iterationError is null)
+                if (!gotFrame && cziPath is not null && iterationError is null)
                 {
-                    var read = await ReadCziWithRetryAsync(Path.Combine(outputDirectory, name + ".czi"), token, timeoutMs: 30_000).ConfigureAwait(false);
-                    cziFrame = read.Frame;
-                    if (cziFrame is null)
-                        lastError = read.Error;
+                    // The run is over: make sure the newest plane is shown. Wait longer when nothing has appeared yet.
+                    await FinishTailAsync(tail, cziPath, token).ConfigureAwait(false);
+                    if (tail.Shown == 0)
+                        lastError = tail.Error;
                 }
 
-                if (outputDirectory is not null)
+                if (cziPath is not null)
                 {
-                    leftovers.Add(Path.Combine(outputDirectory, name + ".czi"));
+                    leftovers.Add(cziPath);
                     leftovers.RemoveAll(TryDeleteQuiet);
                 }
 
-                if (gotFrame || cziFrame is not null)
+                if (gotFrame || tail.Shown > 0)
                 {
                     failures = 0;
                     lastError = null;
-                    var mode = cziFrame is not null
-                        ? "ZEN live running (reading each acquired image from its CZI, about one image every few seconds)"
-                        : "ZEN live running (pixel stream)";
-                    if (mode != shownMode)
-                    {
-                        shownMode = mode;
-                        SetStatus(mode);
-                    }
-
-                    if (cziFrame is not null)
-                        PublishFrame(cziFrame);
                     continue;
                 }
 
@@ -413,10 +431,12 @@ public sealed class ZenApiCameraService : ICameraService, IZenClient, IAsyncDisp
 
                 if (Interlocked.Increment(ref _streamFrames) == 1)
                 {
-                    SetStatus(
+                    var mode =
                         $"ZEN live running (pixel stream, {frame.Width}x{frame.Height} {frame.PixelFormat}, " +
                         $"channel {response.FrameData?.FramePosition?.C.ToString() ?? "n/a"})" +
-                        (string.IsNullOrEmpty(skip) ? string.Empty : $" - {skip}"));
+                        (string.IsNullOrEmpty(skip) ? string.Empty : $" - {skip}");
+                    _liveMode = mode;
+                    SetStatus(mode);
                 }
 
                 PublishFrame(frame);
@@ -445,7 +465,7 @@ public sealed class ZenApiCameraService : ICameraService, IZenClient, IAsyncDisp
     private void PublishFrame(CameraFrame frame)
     {
         lock (_gate) _lastFrame = frame;
-        Interlocked.Increment(ref _liveFrames);
+        var total = Interlocked.Increment(ref _liveFrames);
         try
         {
             FrameReceived?.Invoke(this, new CameraFrameEventArgs(frame));
@@ -453,6 +473,98 @@ public sealed class ZenApiCameraService : ICameraService, IZenClient, IAsyncDisp
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "Frame handler failed");
+        }
+
+        ReportLiveRate(total);
+    }
+
+    /// <summary>
+    /// Shows the measured frame rate in the status, and writes it to the activity log once per live session
+    /// together with how many ZEN runs the frames came from (one run per frame means snap-type; many per run
+    /// means a time series is feeding it).
+    /// </summary>
+    private void ReportLiveRate(int totalFrames)
+    {
+        var now = Environment.TickCount64;
+        var fps = _rate.Add(now, out var inWindow);
+        var mode = _liveMode;
+        if (fps <= 0 || mode.Length == 0 || now - Interlocked.Read(ref _rateStatusAt) < 1_000)
+            return;
+
+        Interlocked.Exchange(ref _rateStatusAt, now);
+        lock (_gate) _status = $"{mode} - {fps:0.0} frames/s";
+
+        if (inWindow >= 5 && !_rateLogged)
+        {
+            _rateLogged = true;
+            var runs = Math.Max(Volatile.Read(ref _liveRuns), 1);
+            _activityLog.Write(
+                "zen",
+                $"Live view rate: {fps:0.0} frames/s ({totalFrames} frames from {runs} ZEN run{(runs == 1 ? string.Empty : "s")} so far)");
+        }
+    }
+
+    // ---------------------------------------------------------------- following a CZI while ZEN writes it
+
+    private sealed class LiveTail
+    {
+        public CziTail Reader { get; } = new();
+        public int Shown { get; set; }
+        public string? Error { get; set; }
+        public bool Permanent { get; set; }
+        public bool Stopped { get; set; }
+    }
+
+    /// <summary>Shows the newest plane in the CZI if it has one that was not shown yet. Returns false when the file could not be read (yet).</summary>
+    private async Task<bool> TailCziAsync(LiveTail tail, string path, bool force, CancellationToken token)
+    {
+        if (tail.Permanent)
+            return false;
+
+        var result = await Task.Run(
+            () =>
+            {
+                var ok = tail.Reader.TryReadNew(path, _tileDecoders, force, out var frame, out var error, out var permanent);
+                return (Ok: ok, Frame: frame, Error: error, Permanent: permanent);
+            },
+            CancellationToken.None).ConfigureAwait(false);
+        token.ThrowIfCancellationRequested();
+
+        if (!result.Ok)
+        {
+            tail.Error = result.Error;
+            tail.Permanent = result.Permanent;
+            return false;
+        }
+
+        if (result.Frame is not null)
+        {
+            tail.Shown++;
+            tail.Error = null;
+            const string mode = "ZEN live running (reading the images ZEN writes to its CZI)";
+            if (_liveMode.Length == 0)
+            {
+                _liveMode = mode;
+                SetStatus(mode);
+            }
+
+            PublishFrame(result.Frame);
+        }
+
+        return true;
+    }
+
+    /// <summary>After the run has ended, shows any last plane. Waits longer for the first image than for later ones.</summary>
+    private async Task FinishTailAsync(LiveTail tail, string path, CancellationToken token)
+    {
+        var deadline = Environment.TickCount64 + (tail.Shown == 0 ? 30_000 : 3_000);
+        while (!token.IsCancellationRequested)
+        {
+            if (await TailCziAsync(tail, path, force: true, token).ConfigureAwait(false) || tail.Permanent)
+                return;
+            if (Environment.TickCount64 >= deadline)
+                return;
+            await Task.Delay(100, token).ConfigureAwait(false);
         }
     }
 
@@ -572,47 +684,72 @@ public sealed class ZenApiCameraService : ICameraService, IZenClient, IAsyncDisp
     }
 
     /// <summary>
-    /// Polls until the experiment has run and stopped. A just-started experiment may not report "running" yet, so a
-    /// "not running" answer only ends the wait once it was seen running, its CZI already exists, or a few seconds passed.
+    /// Polls until the experiment has run and stopped, calling <paramref name="whileRunning"/> every ~60 ms so the
+    /// caller can pick up images as they are written. A just-started experiment may not report "running" yet, so a
+    /// "not running" answer only ends the wait once it was seen running, its CZI already exists, or a few seconds
+    /// passed (and never in the first 300 ms).
     /// </summary>
     private async Task WaitForExperimentEndAsync(
         ExperimentService.ExperimentServiceClient experiment,
         Metadata metadata,
         string experimentId,
         string? expectedCziPath,
+        Func<CancellationToken, Task>? whileRunning,
         CancellationToken token)
     {
+        const int tickMs = 60;
+        const int statusEveryMs = 150;
         var started = Environment.TickCount64;
+        var lastStatus = long.MinValue;
         var errors = 0;
         var sawRunning = false;
-        await Task.Delay(300, token).ConfigureAwait(false);
         while (Environment.TickCount64 - started < 600_000)
         {
-            try
+            token.ThrowIfCancellationRequested();
+            if (whileRunning is not null)
             {
-                var response = await experiment.GetStatusAsync(
-                    new ExperimentServiceGetStatusRequest { ExperimentId = experimentId },
-                    headers: metadata,
-                    deadline: DateTime.UtcNow.AddSeconds(8),
-                    cancellationToken: token).ResponseAsync.ConfigureAwait(false);
-                if (response.Status is not null && response.Status.IsExperimentRunning)
+                try { await whileRunning(token).ConfigureAwait(false); }
+                catch (Exception ex) when (ex is not OperationCanceledException)
                 {
-                    sawRunning = true;
+                    _logger.LogDebug(ex, "ZEN live image pickup failed during a run");
                 }
-                else if (sawRunning
-                         || (expectedCziPath is not null && File.Exists(expectedCziPath))
-                         || Environment.TickCount64 - started > 3_000)
-                {
-                    return;
-                }
-            }
-            catch (RpcException ex) when (ex.StatusCode != StatusCode.Cancelled)
-            {
-                if (++errors >= 3)
-                    return;
             }
 
-            await Task.Delay(250, token).ConfigureAwait(false);
+            var now = Environment.TickCount64;
+            if (now - lastStatus >= statusEveryMs)
+            {
+                lastStatus = now;
+                try
+                {
+                    var response = await experiment.GetStatusAsync(
+                        new ExperimentServiceGetStatusRequest { ExperimentId = experimentId },
+                        headers: metadata,
+                        deadline: DateTime.UtcNow.AddSeconds(8),
+                        cancellationToken: token).ResponseAsync.ConfigureAwait(false);
+                    if (response.Status is not null && response.Status.IsExperimentRunning)
+                    {
+                        sawRunning = true;
+                    }
+                    else
+                    {
+                        var elapsed = Environment.TickCount64 - started;
+                        if (elapsed >= 300
+                            && (sawRunning
+                                || (expectedCziPath is not null && File.Exists(expectedCziPath))
+                                || elapsed > 3_000))
+                        {
+                            return;
+                        }
+                    }
+                }
+                catch (RpcException ex) when (ex.StatusCode != StatusCode.Cancelled)
+                {
+                    if (++errors >= 3)
+                        return;
+                }
+            }
+
+            await Task.Delay(tickMs, token).ConfigureAwait(false);
         }
     }
 
@@ -963,7 +1100,7 @@ public sealed class ZenApiCameraService : ICameraService, IZenClient, IAsyncDisp
 
             if (Environment.TickCount64 >= deadline)
                 return (null, lastError);
-            await Task.Delay(300, token).ConfigureAwait(false);
+            await Task.Delay(100, token).ConfigureAwait(false);
         }
     }
 
