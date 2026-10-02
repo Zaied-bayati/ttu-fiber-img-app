@@ -55,26 +55,9 @@ public static class CziReader
         IReadOnlyList<ICziTileDecoder>? extraDecoders,
         out CameraFrame? frame,
         out string error,
-        out bool permanent) =>
-        TryReadPlane(stream, extraDecoders, latest: false, afterKey: -1, out frame, out _, out error, out permanent);
-
-    /// <summary>
-    /// Reads one plane. With <paramref name="latest"/> it is the most recently written one (the live view follows a
-    /// file ZEN is still appending to); a plane whose key is not past <paramref name="afterKey"/> is not read again and
-    /// the call succeeds with a null frame. <paramref name="key"/> identifies the plane (its file position).
-    /// </summary>
-    internal static bool TryReadPlane(
-        Stream stream,
-        IReadOnlyList<ICziTileDecoder>? extraDecoders,
-        bool latest,
-        long afterKey,
-        out CameraFrame? frame,
-        out long key,
-        out string error,
         out bool permanent)
     {
         frame = null;
-        key = -1;
         permanent = false;
         try
         {
@@ -99,8 +82,8 @@ public static class CziReader
             }
 
             var metadataPosition = BinaryPrimitives.ReadInt64LittleEndian(header.AsSpan(60));
-            var assembled = TryAssemblePlane(
-                stream, entries, extraDecoders, metadataPosition, latest, afterKey, out frame, out key, out error, out var unusable);
+            var significantBits = TryReadComponentBitCount(stream, metadataPosition);
+            var assembled = TryAssemblePlane(stream, entries, extraDecoders, significantBits, out frame, out error, out var unusable);
             permanent = unusable;
             return assembled;
         }
@@ -115,16 +98,12 @@ public static class CziReader
         Stream stream,
         List<Entry> allEntries,
         IReadOnlyList<ICziTileDecoder>? extraDecoders,
-        long metadataPosition,
-        bool latest,
-        long afterKey,
+        int? significantBits,
         out CameraFrame? frame,
-        out long key,
         out string error,
         out bool unusable)
     {
         frame = null;
-        key = -1;
         unusable = true; // every failure below means the data was readable but cannot be turned into an image
 
         var candidates = allEntries.Where(e => e.PyramidType == 0 && e.Has('X') && e.Has('Y')).ToList();
@@ -136,28 +115,9 @@ public static class CziReader
             return false;
         }
 
-        Entry first;
-        if (latest)
-        {
-            // The newest write of the lowest channel: planes are appended in acquisition order.
-            var channel = candidates.Min(e => e.Start('C'));
-            first = candidates.Where(e => e.Start('C') == channel).OrderByDescending(e => e.FilePosition).First();
-            key = first.FilePosition;
-            if (key <= afterKey)
-            {
-                error = string.Empty;
-                unusable = false;
-                return true; // nothing newer than the plane already shown
-            }
-        }
-        else
-        {
-            first = candidates
-                .OrderBy(e => e.Start('C')).ThenBy(e => e.Start('Z')).ThenBy(e => e.Start('T')).ThenBy(e => e.Start('S'))
-                .First();
-            key = first.FilePosition;
-        }
-
+        var first = candidates
+            .OrderBy(e => e.Start('C')).ThenBy(e => e.Start('Z')).ThenBy(e => e.Start('T')).ThenBy(e => e.Start('S'))
+            .First();
         var plane = candidates.Where(e => e.SamePlaneAs(first)).ToList();
 
         var format = first.PixelType switch
@@ -227,7 +187,7 @@ public static class CziReader
             Height = height,
             PixelFormat = format,
             CapturedAt = DateTimeOffset.UtcNow,
-            SignificantBits = format == CameraPixelFormat.Gray16 ? TryReadComponentBitCount(stream, metadataPosition) : null,
+            SignificantBits = format == CameraPixelFormat.Gray16 ? significantBits : null,
         };
         error = string.Empty;
         unusable = false;
@@ -311,10 +271,6 @@ public static class CziReader
         for (var guard = 0; guard < 200_000 && position + SegmentHeaderSize <= stream.Length; guard++)
         {
             if (!ReadSegmentHeader(stream, position, out var id, out var allocated, out var used))
-                break;
-
-            // A segment that runs past the end of the file is still being written; leave it for the next look.
-            if (position + SegmentHeaderSize + Math.Max(used, 0) > stream.Length)
                 break;
 
             if (id == "ZISRAWSUBBLOCK")
